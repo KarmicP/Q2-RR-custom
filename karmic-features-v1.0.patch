@@ -1,0 +1,4045 @@
+diff --git a/projects/msvc/game.vcxproj b/projects/msvc/game.vcxproj
+index 91cc6fad..b959f234 100644
+--- a/projects/msvc/game.vcxproj
++++ b/projects/msvc/game.vcxproj
+@@ -110,6 +110,9 @@
+       <EnableCOMDATFolding>true</EnableCOMDATFolding>
+       <OptimizeReferences>true</OptimizeReferences>
+       <GenerateDebugInformation>true</GenerateDebugInformation>
++      <!-- [KarmicP] Embed only the PDB filename, not the absolute build path, so the
++           shipped DLL leaks no username / home path / repo name (machine-agnostic). -->
++      <AdditionalOptions>/PDBALTPATH:%_PDB% %(AdditionalOptions)</AdditionalOptions>
+     </Link>
+   </ItemDefinitionGroup>
+   <ItemGroup>
+@@ -193,6 +196,7 @@
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_nav_bake.h" />
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_parse.h" />
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_pconfig.h" />
++    <ClInclude Include="..\..\src\sgame\muffmode\mm_pconfig_rules.h" />
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_profile.h" />
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_red_rover_rules.h" />
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_scoreboard_layout.h" />
+@@ -293,6 +297,8 @@
+     <ClCompile Include="..\..\src\sgame\monsters\m_widow.cpp" />
+     <ClCompile Include="..\..\src\sgame\monsters\m_widow2.cpp" />
+     <ClCompile Include="..\..\src\sgame\muffmode\mm_admin.cpp" />
++    <ClCompile Include="..\..\src\sgame\muffmode\mm_bans.cpp" />
++    <ClCompile Include="..\..\src\sgame\muffmode\mm_ranks.cpp" />
+     <ClCompile Include="..\..\src\sgame\muffmode\mm_captain.cpp" />
+     <ClCompile Include="..\..\src\sgame\muffmode\mm_combat_heatmap.cpp" />
+     <ClCompile Include="..\..\src\sgame\muffmode\mm_debug.cpp" />
+diff --git a/projects/msvc/game.vcxproj.filters b/projects/msvc/game.vcxproj.filters
+index c3cd3830..43584d61 100644
+--- a/projects/msvc/game.vcxproj.filters
++++ b/projects/msvc/game.vcxproj.filters
+@@ -235,6 +235,9 @@
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_pconfig.h">
+       <Filter>sgame\muffmode</Filter>
+     </ClInclude>
++    <ClInclude Include="..\..\src\sgame\muffmode\mm_pconfig_rules.h">
++      <Filter>sgame\muffmode</Filter>
++    </ClInclude>
+     <ClInclude Include="..\..\src\sgame\muffmode\mm_skin.h">
+       <Filter>sgame\muffmode</Filter>
+     </ClInclude>
+@@ -603,6 +606,12 @@
+     <ClCompile Include="..\..\src\sgame\muffmode\mm_admin.cpp">
+       <Filter>sgame\muffmode</Filter>
+     </ClCompile>
++    <ClCompile Include="..\..\src\sgame\muffmode\mm_bans.cpp">
++      <Filter>sgame\muffmode</Filter>
++    </ClCompile>
++    <ClCompile Include="..\..\src\sgame\muffmode\mm_ranks.cpp">
++      <Filter>sgame\muffmode</Filter>
++    </ClCompile>
+     <ClCompile Include="..\..\src\sgame\muffmode\mm_gametype.cpp">
+       <Filter>sgame\muffmode</Filter>
+     </ClCompile>
+diff --git a/src/sgame/client/lifecycle.cpp b/src/sgame/client/lifecycle.cpp
+index 6c2c1500..65b4c850 100644
+--- a/src/sgame/client/lifecycle.cpp
++++ b/src/sgame/client/lifecycle.cpp
+@@ -4,6 +4,7 @@
+ #include "userinfo.h"
+ #include "monsters/m_player.h"
+ #include "bots/bot_includes.h"
++#include "muffmode/mm_bans.h"
+ #include "muffmode/mm_captain.h"
+ #include "muffmode/mm_ghost.h"
+ #include "muffmode/mm_horde.h"
+@@ -671,8 +672,13 @@ static bool InitPlayerTeam(gentity_t *ent) {
+ 		return true;
+ 	}
+ 
+-	// already initialised
+-	if (ent->client->sess.team != TEAM_NONE)
++	// already initialised. ClientConnect pre-sets fresh deathmatch clients to
++	// TEAM_SPECTATOR before first spawn, which made this early-return swallow
++	// every human before the g_dm_force_join / g_dm_auto_join block below could
++	// run (the cvars were dead for humans). An uninitialised spectator is really
++	// a brand-new client awaiting first join, so let them fall through. [MuffMode]
++	if (ent->client->sess.team != TEAM_NONE &&
++		(ent->client->sess.initialised || ent->client->sess.team != TEAM_SPECTATOR))
+ 		return true;
+ 
+ 	ent->client->sess.team = TEAM_SPECTATOR;
+@@ -1477,6 +1483,13 @@ loadgames will.
+ ============
+ */
+ bool ClientConnect(gentity_t *ent, char *userinfo, const char *social_id, bool is_bot) {
++	// [KarmicP] Reject banned players up front (by stable social_id; bots are
++	// never banned). Refusing here returns false before any client setup.
++	if (!is_bot && MM_IsBanned(social_id)) {
++		gi.Info_SetValueForKey(userinfo, "rejmsg", "You are banned from this server.");
++		return false;
++	}
++
+ 	ent->client->sess.team = deathmatch->integer ? TEAM_NONE : TEAM_FREE;
+ 
+ 	// they can connect
+@@ -1497,14 +1510,7 @@ bool ClientConnect(gentity_t *ent, char *userinfo, const char *social_id, bool i
+ 			ent->client->sess.team = deathmatch->integer ? TEAM_SPECTATOR : TEAM_FREE;
+ 			P_PublishEngineTeam(ent);
+ 			//InitPlayerTeam(ent);
+-			ent->client->sess.pc.show_id = true;
+-			ent->client->sess.pc.show_timer = true;
+-			ent->client->sess.pc.show_fragmessages = true;
+-			ent->client->sess.pc.killbeep_num = 1;
+-			ent->client->sess.pc.follow_killer = false;
+-			ent->client->sess.pc.follow_powerup = false;
+-			ent->client->sess.pc.enemy_skin[0] = 0;
+-			ent->client->sess.pc.team_skin[0] = 0;
++			ent->client->sess.pc = MM_DefaultClientConfig();
+ 
+ 			InitClientResp(ent->client);
+ 		}
+diff --git a/src/sgame/core/commands.cpp b/src/sgame/core/commands.cpp
+index 9919cae5..263481f5 100644
+--- a/src/sgame/core/commands.cpp
++++ b/src/sgame/core/commands.cpp
+@@ -3,7 +3,9 @@
+ #include "g_local.h"
+ #include "debug_log.h"
+ #include "muffmode/mm_admin.h"
++#include "muffmode/mm_bans.h"
+ #include "muffmode/mm_captain.h"
++#include "muffmode/mm_ranks.h"
+ #include "muffmode/mm_command_contracts.h"
+ #include "muffmode/mm_duel.h"
+ #include "muffmode/mm_ghost.h"
+@@ -17,6 +19,7 @@
+ #include "muffmode/mm_skin.h"
+ #include "muffmode/mm_statusbar.h"
+ #include "muffmode/mm_team.h"
++#include "muffmode/mm_util.h"
+ #include "muffmode/mm_vote.h"
+ #include "muffmode/mm_vote_menu.h"
+ #include "monsters/m_player.h"
+@@ -93,17 +96,6 @@ static bool CmdClientIndexIsValid(int client_index) {
+ 	return client_index >= 0 && static_cast<size_t>(client_index) < game.maxclients;
+ }
+ 
+-static gentity_t *CmdEntityForClientIndex(int client_index) {
+-	if (!CmdClientIndexIsValid(client_index))
+-		return nullptr;
+-
+-	const size_t entity_index = static_cast<size_t>(client_index) + 1;
+-	if (entity_index >= CmdClientEntityCount())
+-		return nullptr;
+-
+-	return &g_entities[entity_index];
+-}
+-
+ //=================================================================================
+ 
+ static void SelectNextItem(gentity_t *ent, item_flags_t itflags, bool menu = true) {
+@@ -1968,6 +1960,101 @@ static void Cmd_Boot_f(gentity_t *ent) {
+ 	gi.AddCommandString(G_Fmt("kick {}\n", targ - g_entities).data());
+ }
+ 
++// [KarmicP] Set the fallback map (g_default_map) and persist it to
++// defaultmap.cfg. Does NOT change the current map.
++static void Cmd_DefaultMap_f(gentity_t *ent) {
++	if (gi.argc() < 2) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Default map is \"{}\".\n", muffmode::CvarString(g_default_map));
++		return;
++	}
++	const char *token = gi.argv(1);
++	if (!MM_IsSafeMapToken(token)) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Invalid map token.\n");
++		return;
++	}
++	gi.cvar_forceset("g_default_map", token);
++	MM_DefaultMap_Save(token);
++	gi.LocBroadcast_Print(PRINT_HIGH, "Default map set to {} (saved).\n", token);
++}
++
++// [KarmicP] Ban the player in the given slot by social_id, then kick them.
++static void Cmd_Ban_f(gentity_t *ent) {
++	if (gi.argc() < 2) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Usage: {} [client number] [reason]\n", gi.argv(0));
++		return;
++	}
++
++	if (*gi.argv(1) < '0' || *gi.argv(1) > '9') {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Specify the player number to ban.\n");
++		return;
++	}
++
++	gentity_t *targ = ClientEntFromString(gi.argv(1));
++	if (targ == nullptr || !targ->inuse || !targ->client) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Invalid client number.\n");
++		return;
++	}
++
++	if (targ == &g_entities[1]) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "You cannot ban the lobby owner.\n");
++		return;
++	}
++
++	if (targ->client->sess.admin) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "You cannot ban an admin.\n");
++		return;
++	}
++
++	std::string reason;
++	for (int i = 2; i < gi.argc(); ++i) {
++		if (!reason.empty())
++			reason += ' ';
++		reason += gi.argv(i);
++	}
++
++	const char *sid = targ->client->pers.social_id;
++	if (targ->client->sess.is_a_bot || sid == nullptr || sid[0] == '\0') {
++		gi.LocClient_Print(ent, PRINT_HIGH, "That player has no social ID (bot or unauthenticated); kicking instead.\n");
++		gi.AddCommandString(G_Fmt("kick {}\n", targ - g_entities).data());
++		return;
++	}
++
++	MM_Bans_Add(sid, targ->client->resp.netname, reason);
++	gi.LocBroadcast_Print(PRINT_HIGH, "{} was banned.\n", targ->client->resp.netname);
++	gi.AddCommandString(G_Fmt("kick {}\n", targ - g_entities).data());
++}
++
++// [KarmicP] Remove a ban by social_id (from 'banlist').
++static void Cmd_Unban_f(gentity_t *ent) {
++	if (gi.argc() < 2) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Usage: {} [social_id]  (see 'banlist')\n", gi.argv(0));
++		return;
++	}
++
++	if (MM_Bans_Remove(gi.argv(1)))
++		gi.LocClient_Print(ent, PRINT_HIGH, "Removed ban for {}.\n", gi.argv(1));
++	else
++		gi.LocClient_Print(ent, PRINT_HIGH, "No ban found for {}.\n", gi.argv(1));
++}
++
++// [KarmicP] Print the ban list.
++static void Cmd_BanList_f(gentity_t *ent) {
++	MM_Bans_Print(ent);
++}
++
++// [KarmicP] Print the cross-session leaderboard (top players by Elo).
++static void Cmd_Leaderboard_f(gentity_t *ent) {
++	std::vector<std::string> lines;
++	MM_Ranks_TopLines(15, lines);
++	if (lines.empty()) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "No ranked matches yet.\n");
++		return;
++	}
++	gi.LocClient_Print(ent, PRINT_HIGH, "-- Server Leaderboard --\n");
++	for (const std::string &line : lines)
++		gi.LocClient_Print(ent, PRINT_HIGH, "{}\n", line.c_str());
++}
++
+ static void Cmd_Doctor_f(gentity_t *ent) {
+ 	MM_CmdDoctor(ent);
+ }
+@@ -2057,8 +2144,7 @@ Cmd_FollowKiller_f
+ =================
+ */
+ static void Cmd_FollowKiller_f(gentity_t *ent) {
+-	ent->client->sess.pc.follow_killer ^= true;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow killer: {}\n", ent->client->sess.pc.follow_killer ? "ON" : "OFF");
++	MM_CmdFollowKiller(ent);
+ }
+ 
+ /*
+@@ -2067,30 +2153,7 @@ Cmd_FollowLeader_f
+ =================
+ */
+ static void Cmd_FollowLeader_f(gentity_t *ent) {
+-	ent->client->sess.pc.follow_leader ^= true;
+-
+-	gentity_t *leader = nullptr;
+-
+-	if (ent->client->sess.pc.follow_leader) {
+-		leader = CmdEntityForClientIndex(level.sorted_clients[0]);
+-		if (!level.num_playing_clients || !leader || !leader->inuse || !leader->client || !ClientIsPlaying(leader->client)) {
+-			ent->client->sess.pc.follow_leader = false;
+-			gi.Client_Print(ent, PRINT_HIGH, "No leader available to follow.\n");
+-			gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow leader: OFF\n");
+-			return;
+-		}
+-	}
+-
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow leader: {}\n", ent->client->sess.pc.follow_leader ? "ON" : "OFF");
+-
+-	if (!ClientIsPlaying(ent->client) && ent->client->sess.pc.follow_leader && ent->client->follow_target != leader) {
+-		ent->client->follow_target = leader;
+-		ent->client->follow_update = true;
+-		UpdateChaseCam(ent);
+-
+-		// [MuffMode] Follow target changed; re-evaluate this viewer's skin overrides.
+-		MM_RefreshSkinOverridesForViewer(ent);
+-	}
++	MM_CmdFollowLeader(ent);
+ }
+ 
+ /*
+@@ -2099,8 +2162,7 @@ Cmd_FollowPowerup_f
+ =================
+ */
+ static void Cmd_FollowPowerup_f(gentity_t *ent) {
+-	ent->client->sess.pc.follow_powerup ^= true;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow powerup pick-ups: {}\n", ent->client->sess.pc.follow_powerup ? "ON" : "OFF");
++	MM_CmdFollowPowerup(ent);
+ }
+ 
+ /*----------------------------------------------------------------*/
+@@ -2266,6 +2328,11 @@ cmds_t client_cmds[] = {
+ 	{"announcer",		Cmd_Announcer_f,		CF_ALLOW_SPEC | CF_ALLOW_DEAD},
+ 	{"balance",			Cmd_BalanceTeams_f,		CF_ADMIN_ONLY | CF_ALLOW_INT | CF_ALLOW_SPEC},
+ 	{"boot",			Cmd_Boot_f,				CF_ADMIN_ONLY | CF_ALLOW_INT | CF_ALLOW_SPEC},
++	{"ban",				Cmd_Ban_f,				CF_ADMIN_ONLY | CF_ALLOW_INT | CF_ALLOW_SPEC},
++	{"defaultmap",		Cmd_DefaultMap_f,		CF_ADMIN_ONLY | CF_ALLOW_INT | CF_ALLOW_SPEC},
++	{"unban",			Cmd_Unban_f,			CF_ADMIN_ONLY | CF_ALLOW_INT | CF_ALLOW_SPEC},
++	{"banlist",			Cmd_BanList_f,			CF_ADMIN_ONLY | CF_ALLOW_INT | CF_ALLOW_SPEC},
++	{"leaderboard",		Cmd_Leaderboard_f,		CF_ALLOW_INT | CF_ALLOW_SPEC},
+ 	{"callvote",		Cmd_CallVote_f,			CF_ALLOW_DEAD | CF_ALLOW_SPEC},
+ 	{"captain",			Cmd_Captain_f,			CF_ALLOW_DEAD},
+ 	{"checkpoi",		Cmd_CheckPOI_f,			CF_ALLOW_SPEC | CF_CHEAT_PROTECT},
+diff --git a/src/sgame/core/runtime.cpp b/src/sgame/core/runtime.cpp
+index aa6bd5bc..fd9271ac 100644
+--- a/src/sgame/core/runtime.cpp
++++ b/src/sgame/core/runtime.cpp
+@@ -4,7 +4,9 @@
+ #include "g_local.h"
+ #include "debug_log.h"
+ #include "entities/shadow_lights.h"
++#include "muffmode/mm_bans.h"
+ #include "muffmode/mm_captain.h"
++#include "muffmode/mm_ranks.h"
+ #include "muffmode/mm_combat_heatmap.h"
+ #include "muffmode/mm_duel.h"
+ #include "muffmode/mm_gametype.h"
+@@ -267,6 +269,17 @@ cvar_t *g_lag_compensation_enhanced;
+ cvar_t *g_map_list;
+ cvar_t *g_map_list_shuffle;
+ cvar_t *g_map_pool;
++cvar_t *g_default_map;
++cvar_t *g_hard_map_rotation;
++cvar_t *g_map_size_logic;
++cvar_t *g_map_pool_small;
++cvar_t *g_map_pool_medium;
++cvar_t *g_map_pool_large;
++cvar_t *g_map_medium_min;
++cvar_t *g_map_large_min;
++cvar_t *g_bot_human_cutoff;
++cvar_t *g_powerup_respawn_min;
++cvar_t *g_powerup_respawn_jitter;
+ cvar_t *g_votable_gametypes;
+ cvar_t *g_votable_rulesets;
+ cvar_t *g_match_lock;
+@@ -481,6 +494,10 @@ static void InitGame() {
+ 
+ 	InitSave();
+ 
++	MM_Bans_Load();
++	MM_Ranks_Load();
++	MM_DefaultMap_Load();
++
+ 	// seed RNG
+ 	mt_rand.seed((uint32_t)std::chrono::system_clock::now().time_since_epoch().count());
+ 	muffmode::combat_heatmap::Init();
+@@ -713,6 +730,17 @@ static void InitGame() {
+ 	g_map_list = gi.cvar("g_map_list", "", CVAR_NOFLAGS);
+ 	g_map_list_shuffle = gi.cvar("g_map_list_shuffle", "1", CVAR_NOFLAGS);
+ 	g_map_pool = gi.cvar("g_map_pool", "", CVAR_NOFLAGS);
++	g_default_map = gi.cvar("g_default_map", "", CVAR_NOFLAGS); // [KarmicP] "" = rotation fallback disabled
++	g_hard_map_rotation = gi.cvar("g_hard_map_rotation", "0", CVAR_NOFLAGS); // [KarmicP] 0 = vanilla soft gamemap; 1 = hard map load (soft-changelevel crash workaround)
++	g_map_size_logic = gi.cvar("g_map_size_logic", "0", CVAR_NOFLAGS);
++	g_map_pool_small = gi.cvar("g_map_pool_small", "", CVAR_NOFLAGS);
++	g_map_pool_medium = gi.cvar("g_map_pool_medium", "", CVAR_NOFLAGS);
++	g_map_pool_large = gi.cvar("g_map_pool_large", "", CVAR_NOFLAGS);
++	g_map_medium_min = gi.cvar("g_map_medium_min", "3", CVAR_NOFLAGS);
++	g_map_large_min = gi.cvar("g_map_large_min", "5", CVAR_NOFLAGS);
++	g_bot_human_cutoff = gi.cvar("g_bot_human_cutoff", "0", CVAR_NOFLAGS); // [KarmicP] >=N connected humans -> kick all bots & stop refills; 0 = off
++	g_powerup_respawn_min = gi.cvar("g_powerup_respawn_min", "120", CVAR_NOFLAGS);   // [KarmicP] powerup respawn floor (seconds)
++	g_powerup_respawn_jitter = gi.cvar("g_powerup_respawn_jitter", "40", CVAR_NOFLAGS); // [KarmicP] + random 0..N seconds on top (anti-camp)
+ 	g_votable_gametypes = gi.cvar("g_votable_gametypes", "", CVAR_NOFLAGS);
+ 	g_votable_rulesets = gi.cvar("g_votable_rulesets", "", CVAR_NOFLAGS);
+ 	g_match_lock = gi.cvar("g_match_lock", "0", CVAR_SERVERINFO);
+@@ -1555,6 +1583,10 @@ void Match_End() {
+ 	level.match_state = matchst_t::MATCH_ENDED;
+ 	level.match_state_timer = 0_sec;
+ 
++	// [KarmicP] Fold this match into the cross-session leaderboard before any of
++	// the intermission early-returns below (player stats are still intact here).
++	MM_Ranks_RecordMatch();
++
+ 	// see if there is a queued map to go to
+ 	if (MM_MQ_Count()) {
+ 		BeginIntermission(CreateTargetChangeLevel(MM_MQ_Go_Next()));
+@@ -1572,10 +1604,23 @@ void Match_End() {
+ 		return;
+ 	}
+ 
++	// [MuffMode local patch] Human-count-based map sizing.
++	// Runs after mymap/same_level/forcemap above, so those (and votes, which
++	// issue gamemap directly) still override. Falls through when disabled or
++	// when no sized map is eligible.
++	if (MM_TryBeginIntermissionBySize())
++		return;
++
+ 	// [MuffMode] Thin vanilla hook for map-list rotation selection.
+ 	if (MM_TryBeginIntermissionFromMapList())
+ 		return;
+ 
++	// [KarmicP local patch] Default-map fallback: if the rotation produced no
++	// next map, load g_default_map (if set). Below the rotation so votes/force/
++	// mymap/size-logic/list all still take precedence.
++	if (MM_TryBeginIntermissionFromDefaultMap())
++		return;
++
+ 	if (level.nextmap[0]) // go to a specific map
+ 	{
+ 		BeginIntermission(CreateTargetChangeLevel(level.nextmap));
+@@ -2202,6 +2247,12 @@ void ExitLevel() {
+ 		!Q_strncasecmp(level.changemap + start_offset, "victor", 6) &&
+ 		!Q_strncasecmp(level.changemap + map_len - 4, ".pcx", 4))
+ 		gi.AddCommandString(G_Fmt("endgame \"{}\"\n", level.changemap + start_offset).data());
++	// [KarmicP] The engine intermittently null-derefs on the soft `gamemap`
++	// ("reconnecting") map load at match end (see crash-archive/, Rip 0x14020aa01;
++	// hard `map` loads of the same map survived). g_hard_map_rotation 1 uses a hard
++	// `map` load here to dodge that engine path. Default 0 = vanilla behavior.
++	else if (g_hard_map_rotation && g_hard_map_rotation->integer)
++		gi.AddCommandString(G_Fmt("map {}\n", level.changemap).data());
+ 	else
+ 		gi.AddCommandString(G_Fmt("gamemap \"{}\"\n", level.changemap).data());
+ 
+diff --git a/src/sgame/entities/item_powerups.cpp b/src/sgame/entities/item_powerups.cpp
+index 8276a3be..89696ee6 100644
+--- a/src/sgame/entities/item_powerups.cpp
++++ b/src/sgame/entities/item_powerups.cpp
+@@ -348,6 +348,15 @@ void Tech_SetupSpawn() {
+ 	if (GT(GT_HORDE) && g_horde_tech_reset_each_wave->integer)
+ 		return;
+ 
++	// [KarmicP] Cancel any still-pending tech spawner before scheduling a new one.
++	// The map-load spawn schedules Tech_SpawnAll on a 2s delay; with instant-start
++	// configs (g_dm_do_warmup 0) Match_Start's Tech_Reset() runs inside that window,
++	// and since no techs have spawned yet it frees nothing and would add a SECOND
++	// spawner -> 2 of each tech a few feet apart. Deduping keeps it at one of each.
++	for (gentity_t *e = g_entities + 1, *end = g_entities + globals.num_entities; e < end; ++e)
++		if (e->inuse && e->think == Tech_SpawnAll)
++			G_FreeEntity(e);
++
+ 	gentity_t *ent = G_Spawn();
+ 	ent->nextthink = level.time + 2_sec;
+ 	ent->think = Tech_SpawnAll;
+diff --git a/src/sgame/entities/spawn.cpp b/src/sgame/entities/spawn.cpp
+index 3b0bb535..996699bf 100644
+--- a/src/sgame/entities/spawn.cpp
++++ b/src/sgame/entities/spawn.cpp
+@@ -1506,7 +1506,8 @@ Only used for the world.
+ "ruleset"			overrides gameplay ruleset (q2re/mm/q3a/q2reb/qc)
+ */
+ void SP_worldspawn(gentity_t *ent) {
+-	Q_strlcpy(level.gamemod_name, G_Fmt("{} v{}", GAMEMOD_TITLE, GAMEMOD_VERSION).data(), sizeof(level.gamemod_name));
++	// [KarmicP] Footer line 1 = our fork; line 2 (base MuffMode version) is set in the join menu.
++	Q_strlcpy(level.gamemod_name, G_Fmt("Q2 RR Karmic v{}", KARMIC_PATCH_VERSION).data(), sizeof(level.gamemod_name));
+ 
+ 	ent->movetype = MOVETYPE_PUSH;
+ 	ent->solid = SOLID_BSP;
+diff --git a/src/sgame/g_local.h b/src/sgame/g_local.h
+index 432374d5..ee4bff39 100644
+--- a/src/sgame/g_local.h
++++ b/src/sgame/g_local.h
+@@ -13,6 +13,11 @@ constexpr const char *GAMEVERSION = "baseq2";
+ constexpr const char *GAMEMOD_TITLE = "Muff Mode";
+ constexpr const char *GAMEMOD_VERSION = "0.60.0";
+ 
++// [KarmicP] Our fork's own patch version, shown on the join-menu footer (kGameMod row)
++// alongside the MuffMode base version. Bump when we ship fork changes. Keep the rendered
++// footer ASCII (classic Quake conchars) and <=~40 chars so it fits one centered line.
++constexpr const char *KARMIC_PATCH_VERSION = "1.0";
++
+ //==================================================================
+ 
+ #define ARRAY_LEN(x)		(sizeof(x) / sizeof(*(x)))
+@@ -2489,6 +2494,17 @@ extern cvar_t *g_lag_compensation_enhanced;
+ extern cvar_t *g_map_list;
+ extern cvar_t *g_map_list_shuffle;
+ extern cvar_t *g_map_pool;
++extern cvar_t *g_default_map; // [KarmicP] fallback map loaded when g_map_list rotation yields nothing ("" = off)
++extern cvar_t *g_hard_map_rotation; // [KarmicP] 1 = match-end map change uses hard `map` load instead of soft `gamemap` (engine soft-changelevel crash workaround)
++extern cvar_t *g_map_size_logic;
++extern cvar_t *g_map_pool_small;
++extern cvar_t *g_map_pool_medium;
++extern cvar_t *g_map_pool_large;
++extern cvar_t *g_map_medium_min;
++extern cvar_t *g_map_large_min;
++extern cvar_t *g_bot_human_cutoff; // [KarmicP] >=N connected humans -> remove all bots (0 = off)
++extern cvar_t *g_powerup_respawn_min;    // [KarmicP] powerup respawn floor (seconds)
++extern cvar_t *g_powerup_respawn_jitter; // [KarmicP] + random 0..N seconds (anti-camp)
+ extern cvar_t *g_votable_gametypes;
+ extern cvar_t *g_votable_rulesets;
+ extern cvar_t *g_match_lock;
+diff --git a/src/sgame/muffmode/mm_bans.cpp b/src/sgame/muffmode/mm_bans.cpp
+new file mode 100644
+index 00000000..a44da619
+--- /dev/null
++++ b/src/sgame/muffmode/mm_bans.cpp
+@@ -0,0 +1,109 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#include "g_local.h"
++#include "muffmode/mm_bans.h"
++#include "muffmode/mm_bans_rules.h"
++
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++namespace {
++
++constexpr const char *k_ban_file = "baseq2/bans.cfg";
++
++std::vector<muffmode::bans::BanRecord> g_ban_list;
++
++bool ReadFileText(const std::filesystem::path &path, std::string &out) {
++	std::error_code ec;
++	if (!std::filesystem::exists(path, ec))
++		return false;
++	std::ifstream in(path, std::ios::binary);
++	if (!in)
++		return false;
++	out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++	return true;
++}
++
++// Atomic-ish write: write a temp file then rename over the target.
++bool WriteBanFile() {
++	const std::filesystem::path path(k_ban_file);
++	const std::filesystem::path tmp = std::filesystem::path(std::string(k_ban_file) + ".tmp");
++	std::error_code ec;
++	std::filesystem::create_directories(path.parent_path(), ec);
++	{
++		std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++		if (!out)
++			return false;
++		const std::string text = muffmode::bans::FormatBanFile(g_ban_list);
++		out.write(text.data(), static_cast<std::streamsize>(text.size()));
++		if (!out.good())
++			return false;
++	}
++	std::filesystem::rename(tmp, path, ec);
++	if (ec) {
++		// Windows rename fails if the target exists; replace it explicitly.
++		std::filesystem::remove(path, ec);
++		std::filesystem::rename(tmp, path, ec);
++	}
++	return !ec;
++}
++
++} // namespace
++
++void MM_Bans_Load() {
++	g_ban_list.clear();
++	std::string text;
++	if (ReadFileText(k_ban_file, text))
++		g_ban_list = muffmode::bans::ParseBanFile(text);
++	gi.Com_PrintFmt("MuffMode: loaded {} ban(s) from {}\n", g_ban_list.size(), k_ban_file);
++}
++
++bool MM_IsBanned(const char *social_id) {
++	if (!social_id || !*social_id)
++		return false;
++	return muffmode::bans::IsBanned(g_ban_list, social_id);
++}
++
++bool MM_Bans_Add(std::string_view social_id, std::string_view name, std::string_view reason) {
++	if (social_id.empty())
++		return false;
++	muffmode::bans::BanRecord rec{ std::string(social_id), std::string(name), std::string(reason) };
++	const bool added = muffmode::bans::AddOrUpdateBan(g_ban_list, rec);
++	WriteBanFile();
++	return added;
++}
++
++bool MM_Bans_Remove(std::string_view social_id) {
++	const bool removed = muffmode::bans::RemoveBan(g_ban_list, social_id);
++	if (removed)
++		WriteBanFile();
++	return removed;
++}
++
++void MM_Bans_Print(gentity_t *ent) {
++	if (g_ban_list.empty()) {
++		if (ent)
++			gi.LocClient_Print(ent, PRINT_HIGH, "Ban list is empty.\n");
++		else
++			gi.Com_Print("Ban list is empty.\n");
++		return;
++	}
++	if (ent)
++		gi.LocClient_Print(ent, PRINT_HIGH, "-- {} ban(s): social_id | name | reason --\n", g_ban_list.size());
++	else
++		gi.Com_PrintFmt("-- {} ban(s): social_id | name | reason --\n", g_ban_list.size());
++	for (const auto &rec : g_ban_list) {
++		if (ent)
++			gi.LocClient_Print(ent, PRINT_HIGH, "{} | {} | {}\n", rec.social_id.c_str(), rec.name.c_str(), rec.reason.c_str());
++		else
++			gi.Com_PrintFmt("{} | {} | {}\n", rec.social_id, rec.name, rec.reason);
++	}
++}
++
++size_t MM_Bans_Count() {
++	return g_ban_list.size();
++}
+diff --git a/src/sgame/muffmode/mm_bans.h b/src/sgame/muffmode/mm_bans.h
+new file mode 100644
+index 00000000..42a2dac5
+--- /dev/null
++++ b/src/sgame/muffmode/mm_bans.h
+@@ -0,0 +1,32 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// Engine-facing ban list, keyed by social_id. Persisted to baseq2/bans.cfg.
++// Pure record logic lives in mm_bans_rules.h; this exposes the live operations
++// used by connect-time enforcement (lifecycle.cpp) and admin commands
++// (commands.cpp). Bots are never banned (they carry no stable social_id).
++
++#include <cstddef>
++#include <string_view>
++
++struct gentity_t;
++
++// Load the ban file into memory. Called once from InitGame().
++void MM_Bans_Load();
++
++// True if this social_id is on the ban list. Empty/null ids are never banned.
++bool MM_IsBanned(const char *social_id);
++
++// Add (or refresh name/reason of) a ban and persist. Returns true if newly added.
++bool MM_Bans_Add(std::string_view social_id, std::string_view name, std::string_view reason);
++
++// Remove a ban by social_id and persist. Returns true if a record was removed.
++bool MM_Bans_Remove(std::string_view social_id);
++
++// Print the current ban list to a client (or console when ent is null).
++void MM_Bans_Print(gentity_t *ent);
++
++// Number of active bans.
++size_t MM_Bans_Count();
+diff --git a/src/sgame/muffmode/mm_bans_rules.h b/src/sgame/muffmode/mm_bans_rules.h
+new file mode 100644
+index 00000000..f3193cf9
+--- /dev/null
++++ b/src/sgame/muffmode/mm_bans_rules.h
+@@ -0,0 +1,142 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// Pure, host-testable ban-list rules.
++//
++// Bans are keyed by the engine-provided social_id (stable per platform account,
++// unlike name or IP). The persisted form is one record per line:
++//     social_id|name|reason
++// Fields are pipe-delimited; '|' and newlines are stripped from name/reason on
++// write so a record is always exactly one line. Engine-free by design: the live
++// file I/O, connect-time enforcement, and admin commands live in mm_bans.cpp.
++
++#include <cstddef>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace muffmode::bans {
++
++struct BanRecord {
++	std::string social_id;
++	std::string name;   // last-seen display name (informational)
++	std::string reason; // admin-supplied, may be empty
++};
++
++// Replace field separators / newlines so a value never breaks the line format.
++inline std::string SanitizeField(std::string_view in) {
++	std::string out;
++	out.reserve(in.size());
++	for (char c : in) {
++		if (c == '|' || c == '\n' || c == '\r')
++			out.push_back(' ');
++		else
++			out.push_back(c);
++	}
++	return out;
++}
++
++// Serialize one record to its single-line persisted form.
++inline std::string FormatBanLine(const BanRecord &rec) {
++	return SanitizeField(rec.social_id) + "|" + SanitizeField(rec.name) + "|" + SanitizeField(rec.reason);
++}
++
++// Parse one persisted line. Returns false for blank/comment lines or a record
++// with an empty social_id (the required key). Extra '|' beyond the third field
++// are folded into the reason.
++inline bool ParseBanLine(std::string_view line, BanRecord &out) {
++	// trim leading whitespace
++	size_t start = 0;
++	while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
++		++start;
++	line.remove_prefix(start);
++	if (line.empty() || line[0] == '#')
++		return false;
++
++	const size_t p1 = line.find('|');
++	std::string_view id = line.substr(0, p1);
++	if (id.empty())
++		return false;
++
++	out = BanRecord{};
++	out.social_id = std::string(id);
++	if (p1 == std::string_view::npos)
++		return true;
++
++	std::string_view rest = line.substr(p1 + 1);
++	const size_t p2 = rest.find('|');
++	out.name = std::string(rest.substr(0, p2));
++	if (p2 != std::string_view::npos)
++		out.reason = std::string(rest.substr(p2 + 1));
++	return true;
++}
++
++// social_id comparison is exact (platform ids are opaque, case-sensitive).
++inline size_t FindBanIndex(const std::vector<BanRecord> &list, std::string_view social_id) {
++	for (size_t i = 0; i < list.size(); ++i)
++		if (list[i].social_id == social_id)
++			return i;
++	return static_cast<size_t>(-1);
++}
++
++inline bool IsBanned(const std::vector<BanRecord> &list, std::string_view social_id) {
++	return !social_id.empty() && FindBanIndex(list, social_id) != static_cast<size_t>(-1);
++}
++
++// Add a ban, or update the name/reason of an existing one (dedupe by social_id).
++// Returns true if a new record was added, false if an existing one was updated.
++// An empty social_id is rejected (returns false, list unchanged).
++inline bool AddOrUpdateBan(std::vector<BanRecord> &list, const BanRecord &rec) {
++	if (rec.social_id.empty())
++		return false;
++	const size_t idx = FindBanIndex(list, rec.social_id);
++	if (idx != static_cast<size_t>(-1)) {
++		list[idx].name = rec.name;
++		list[idx].reason = rec.reason;
++		return false;
++	}
++	list.push_back(rec);
++	return true;
++}
++
++// Remove a ban by social_id. Returns true if a record was removed.
++inline bool RemoveBan(std::vector<BanRecord> &list, std::string_view social_id) {
++	const size_t idx = FindBanIndex(list, social_id);
++	if (idx == static_cast<size_t>(-1))
++		return false;
++	list.erase(list.begin() + static_cast<std::ptrdiff_t>(idx));
++	return true;
++}
++
++// Serialize the whole list to file text (one record per line, trailing newline).
++inline std::string FormatBanFile(const std::vector<BanRecord> &list) {
++	std::string out;
++	for (const BanRecord &rec : list) {
++		out += FormatBanLine(rec);
++		out.push_back('\n');
++	}
++	return out;
++}
++
++// Parse whole-file text into records (skips blank/comment/invalid lines).
++inline std::vector<BanRecord> ParseBanFile(std::string_view text) {
++	std::vector<BanRecord> list;
++	size_t pos = 0;
++	while (pos <= text.size()) {
++		size_t nl = text.find('\n', pos);
++		std::string_view line = text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
++		if (!line.empty() && line.back() == '\r')
++			line.remove_suffix(1);
++		BanRecord rec;
++		if (ParseBanLine(line, rec))
++			AddOrUpdateBan(list, rec); // dedupe on load
++		if (nl == std::string_view::npos)
++			break;
++		pos = nl + 1;
++	}
++	return list;
++}
++
++} // namespace muffmode::bans
+diff --git a/src/sgame/muffmode/mm_bots_rules.h b/src/sgame/muffmode/mm_bots_rules.h
+new file mode 100644
+index 00000000..2199db62
+--- /dev/null
++++ b/src/sgame/muffmode/mm_bots_rules.h
+@@ -0,0 +1,65 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// Pure, host-testable "drop bots when humans arrive" rules.
++//
++// The KEX engine keeps at least `bot_minClients` total clients filled with bots.
++// The game DLL cannot stop that fill directly, so this decides two things each
++// tick: what to force `bot_minClients` to, and whether to kick the bots that are
++// already present. Once `g_bot_human_cutoff` humans are connected we zero the
++// fill and kick every bot; below the cutoff we restore the server's original
++// fill so bots return. Engine-free by design; the live inputs (human count, the
++// current/cached fill) and the kick/forceset are supplied by mm_bots.cpp glue.
++
++// The server's intended bot fill is `bot_minClients`, but we overwrite that cvar
++// to 0 while suppressing bots — so the caller caches the last non-zero fill it
++// saw and threads it back in as `cached_fill` to restore later.
++struct MM_BotFillDecision {
++	bool update_fill = false; // caller should cvar_forceset bot_minClients
++	int  fill_value = 0;      // ...to this value, when update_fill is true
++	bool kick_bots = false;   // caller should kick all present bots this tick
++	int  cached_fill = 0;     // caller should persist this as the next cached fill
++};
++
++// humans       : connected human clients (bots excluded)
++// cutoff       : g_bot_human_cutoff (<= 0 disables the feature entirely)
++// current_fill : current bot_minClients value
++// cached_fill  : last non-zero fill remembered by the caller (0 = none yet)
++inline MM_BotFillDecision MM_DecideBotFill(int humans, int cutoff, int current_fill, int cached_fill) {
++	MM_BotFillDecision d;
++	d.cached_fill = cached_fill;
++
++	// Remember the desired fill whenever bots are currently allowed to fill, so
++	// we can restore it after a suppression window.
++	if (current_fill > 0)
++		d.cached_fill = current_fill;
++
++	if (cutoff <= 0) {
++		// Feature off: never leave bots suppressed. If we had zeroed the fill,
++		// restore it so bots come back.
++		if (current_fill == 0 && d.cached_fill > 0) {
++			d.update_fill = true;
++			d.fill_value = d.cached_fill;
++		}
++		return d;
++	}
++
++	if (humans >= cutoff) {
++		// Enough humans: stop refills and kick any bots already present.
++		if (current_fill != 0) {
++			d.update_fill = true;
++			d.fill_value = 0;
++		}
++		d.kick_bots = true;
++		return d;
++	}
++
++	// Below the cutoff: allow bots. Restore the cached fill if we had zeroed it.
++	if (current_fill == 0 && d.cached_fill > 0) {
++		d.update_fill = true;
++		d.fill_value = d.cached_fill;
++	}
++	return d;
++}
+diff --git a/src/sgame/muffmode/mm_default_map_rules.h b/src/sgame/muffmode/mm_default_map_rules.h
+new file mode 100644
+index 00000000..57656dab
+--- /dev/null
++++ b/src/sgame/muffmode/mm_default_map_rules.h
+@@ -0,0 +1,37 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// [KarmicP] Pure, host-testable resolution for the "default map" fallback.
++// The rotation fallback fires only when the normal g_map_list rotation produced
++// no next map (that decision is the caller's). This helper answers the narrow
++// question: given the g_default_map cvar value, what token (if any) should load?
++// It trims surrounding ASCII whitespace and returns "" when unset/blank (feature
++// off). Safety (MM_IsSafeMapToken) and the actual map change stay in mm_maps.cpp.
++
++#include <string>
++#include <string_view>
++
++inline std::string MM_ResolveDefaultMap(std::string_view default_token) {
++	size_t b = 0, e = default_token.size();
++	while (b < e && (default_token[b] == ' ' || default_token[b] == '\t'))
++		++b;
++	while (e > b && (default_token[e - 1] == ' ' || default_token[e - 1] == '\t'))
++		--e;
++	return std::string(default_token.substr(b, e - b));
++}
++
++// [KarmicP] Extract the map token from a persisted defaultmap.cfg, which is
++// written as: set g_default_map "<token>". Returns the (whitespace-trimmed)
++// content between the first pair of double quotes, or "" when absent/blank/
++// unquoted. Pure so the host harness can test it.
++inline std::string MM_ParseDefaultMapConfig(std::string_view contents) {
++	size_t q1 = contents.find('"');
++	if (q1 == std::string_view::npos)
++		return "";
++	size_t q2 = contents.find('"', q1 + 1);
++	if (q2 == std::string_view::npos)
++		return "";
++	return MM_ResolveDefaultMap(contents.substr(q1 + 1, q2 - q1 - 1));
++}
+diff --git a/src/sgame/muffmode/mm_items_rules.cpp b/src/sgame/muffmode/mm_items_rules.cpp
+index b233813b..d018242a 100644
+--- a/src/sgame/muffmode/mm_items_rules.cpp
++++ b/src/sgame/muffmode/mm_items_rules.cpp
+@@ -295,6 +295,15 @@ int MM_PowerupRespawnSeconds(gentity_t *ent)
+ 	if (ent->item->quantity)
+ 		count = ent->item->quantity;
+ 
++	// [KarmicP] Anti-camp: for map powerups/spheres in DM, enforce a floor and add
++	// random jitter so pad respawns can't be timed (both tunable via the two cvars).
++	if (deathmatch->integer && (ent->item->flags & (IF_POWERUP | IF_SPHERE))) {
++		const int floor_secs = g_powerup_respawn_min ? g_powerup_respawn_min->integer : 120;
++		const int jitter_max = g_powerup_respawn_jitter ? g_powerup_respawn_jitter->integer : 40;
++		const int jitter = jitter_max > 0 ? irandom(jitter_max + 1) : 0;
++		count = MM_PowerupRespawnClamped(count, floor_secs, jitter);
++	}
++
+ 	return count;
+ }
+ 
+@@ -415,7 +424,10 @@ void MM_OnPowerupItemRespawned(gentity_t *ent)
+ 
+ bool MM_ShouldAnnouncePowerupUse()
+ {
+-	return RS(RS_MM) || RS(RS_Q3A) || RS(RS_VANILLA_PLUS);
++	// [KarmicP] Include RS_Q2RE: on the default ruleset Use_Powerup_BroadcastMsg
++	// otherwise plays no powerup activation sound at all (e.g. the quad damage
++	// "items/damage.wav" use sound was silent on Q2RE deathmatch servers).
++	return RS(RS_Q2RE) || RS(RS_MM) || RS(RS_Q3A) || RS(RS_VANILLA_PLUS);
+ }
+ 
+ // [MuffMode] AutoDoc tech regen with per-ruleset/per-mod tuning (moved from sgame/entities/items.cpp).
+diff --git a/src/sgame/muffmode/mm_items_rules.h b/src/sgame/muffmode/mm_items_rules.h
+index 4a141ae5..e72966b2 100644
+--- a/src/sgame/muffmode/mm_items_rules.h
++++ b/src/sgame/muffmode/mm_items_rules.h
+@@ -23,6 +23,15 @@ gtime_t MM_PowerupInstantPickupTimeout(gentity_t *ent, bool is_dropped_from_deat
+ int MM_PowerupRespawnSeconds(gentity_t *ent);
+ bool MM_DeferInitialPowerupSpawn(gentity_t *ent);
+ 
++// [KarmicP] Anti-camping powerup respawn: raise the base to a floor, then add
++// pre-rolled jitter seconds so pad timings aren't predictable (players can't
++// "time" a pad). jitter_secs is the engine's rolled value in [0, jitter_max];
++// tests pass fixed values. Pure so the host harness can verify the arithmetic.
++inline int MM_PowerupRespawnClamped(int base_secs, int floor_secs, int jitter_secs) {
++	int v = base_secs < floor_secs ? floor_secs : base_secs;
++	return v + (jitter_secs > 0 ? jitter_secs : 0);
++}
++
+ int MM_HealthPickupCap(gentity_t *other);
+ int MM_HealthPickupAmount(gentity_t *ent, int quantity);
+ gtime_t MM_HealthPickupRespawnDelay();
+diff --git a/src/sgame/muffmode/mm_map_size_rules.h b/src/sgame/muffmode/mm_map_size_rules.h
+new file mode 100644
+index 00000000..21827403
+--- /dev/null
++++ b/src/sgame/muffmode/mm_map_size_rules.h
+@@ -0,0 +1,84 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// Pure, host-testable map-rotation sizing rules.
++//
++// The next rotation map is chosen from size buckets gated by the number of human
++// players. Small is always eligible; Medium unlocks at >= medium_min humans;
++// Large at >= large_min. Smaller buckets stay eligible as the count rises
++// (additive). Engine-free by design so the host harness can compile it; the live
++// inputs (cvars, human count, RNG) and the intermission are supplied by
++// mm_maps.cpp.
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <string_view>
++#include <vector>
++
++// ASCII case-insensitive equality (map tokens are ASCII).
++inline bool MM_MapTokenEqualsNoCase(std::string_view a, std::string_view b) {
++	if (a.size() != b.size())
++		return false;
++	for (size_t i = 0; i < a.size(); ++i) {
++		char ca = a[i], cb = b[i];
++		if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca - 'A' + 'a');
++		if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb - 'A' + 'a');
++		if (ca != cb)
++			return false;
++	}
++	return true;
++}
++
++// True when a bucket with the given unlock threshold is eligible at `humans`.
++inline bool MM_MapSizeBucketUnlocked(int humans, int min_humans) {
++	return humans >= min_humans;
++}
++
++// Build the eligible token set for the current human count:
++//  - Small always; Medium if humans >= medium_min; Large if humans >= large_min.
++//  - Deduplicate tokens shared across buckets.
++//  - Remove the current map to avoid an immediate repeat, but only when at least
++//    one other map remains (a single-map result keeps that map).
++// Returns the eligible tokens (possibly empty -> caller falls back to g_map_list).
++inline std::vector<std::string> MM_BuildEligibleSizedMaps(
++	int humans,
++	int medium_min,
++	int large_min,
++	const std::vector<std::string> &small,
++	const std::vector<std::string> &medium,
++	const std::vector<std::string> &large,
++	std::string_view current_map)
++{
++	std::vector<std::string> eligible(small.begin(), small.end());
++	if (MM_MapSizeBucketUnlocked(humans, medium_min))
++		eligible.insert(eligible.end(), medium.begin(), medium.end());
++	if (MM_MapSizeBucketUnlocked(humans, large_min))
++		eligible.insert(eligible.end(), large.begin(), large.end());
++
++	std::sort(eligible.begin(), eligible.end());
++	eligible.erase(std::unique(eligible.begin(), eligible.end()), eligible.end());
++
++	if (eligible.size() > 1) {
++		std::vector<std::string> without_current;
++		without_current.reserve(eligible.size());
++		for (const std::string &m : eligible)
++			if (!MM_MapTokenEqualsNoCase(m, current_map))
++				without_current.push_back(m);
++		if (!without_current.empty())
++			eligible.swap(without_current);
++	}
++
++	return eligible;
++}
++
++// Deterministic pick: index into `eligible` for the given rng value, or SIZE_MAX
++// when empty. Engine passes mt_rand(); tests pass fixed values.
++inline size_t MM_PickEligibleIndex(size_t eligible_size, uint32_t rng_value) {
++	if (eligible_size == 0)
++		return SIZE_MAX;
++	return static_cast<size_t>(rng_value % eligible_size);
++}
+diff --git a/src/sgame/muffmode/mm_maps.cpp b/src/sgame/muffmode/mm_maps.cpp
+index 49af31bf..e5a4ec20 100644
+--- a/src/sgame/muffmode/mm_maps.cpp
++++ b/src/sgame/muffmode/mm_maps.cpp
+@@ -6,10 +6,15 @@
+ #include "muffmode/mm_command_contracts.h"
+ #include "muffmode/mm_items_rules.h"
+ #include "muffmode/mm_maps.h"
++#include "muffmode/mm_map_size_rules.h"
++#include "muffmode/mm_default_map_rules.h"
+ #include "muffmode/mm_util.h"
+ 
+ #include <algorithm>
+ #include <array>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
+ #include <string_view>
+ 
+ namespace muffmode::maps {
+@@ -222,6 +227,70 @@ void MM_GametypeChangeMapFirst()
+ 	gi.AddCommandString(G_Fmt("gamemap \"{}\"\n", first_map).data());
+ }
+ 
++// [MuffMode local patch] Human-count-based map sizing — engine glue.
++static int MM_CountHumans()
++{
++	int humans = 0;
++	for (uint32_t i = 1; i <= game.maxclients; i++) {
++		gentity_t *ent = &g_entities[i];
++		if (!ent->inuse || !ent->client)
++			continue;
++		if (!ent->client->pers.connected)
++			continue;
++		if (ent->client->sess.is_a_bot || (ent->svflags & SVF_BOT))
++			continue;
++		humans++;
++	}
++	return humans;
++}
++
++static std::vector<std::string> MM_TokenizePool(cvar_t *pool)
++{
++	std::vector<std::string> out;
++	if (!pool || !muffmode::CvarString(pool)[0])
++		return out;
++
++	const char *str = muffmode::CvarString(pool);
++	const char *tok;
++	while ((tok = muffmode::maps::ParseNextSafeMapToken(&str)) != nullptr && *tok)
++		out.emplace_back(tok);
++	return out;
++}
++
++std::string MM_SelectSizedMap()
++{
++	if (!muffmode::CvarInteger(g_map_size_logic))
++		return "";
++
++	const int humans = MM_CountHumans();
++	std::vector<std::string> eligible = MM_BuildEligibleSizedMaps(
++		humans,
++		muffmode::CvarInteger(g_map_medium_min),
++		muffmode::CvarInteger(g_map_large_min),
++		MM_TokenizePool(g_map_pool_small),
++		MM_TokenizePool(g_map_pool_medium),
++		MM_TokenizePool(g_map_pool_large),
++		level.mapname);
++
++	const size_t idx = MM_PickEligibleIndex(eligible.size(), static_cast<uint32_t>(mt_rand()));
++	if (idx == SIZE_MAX)
++		return ""; // disabled handled above; here means no eligible maps -> fall back
++
++	MuffModeLog("MAP", "Size logic: %d humans, %d eligible, picked '%s'",
++		humans, static_cast<int>(eligible.size()), eligible[idx].c_str());
++	return eligible[idx];
++}
++
++bool MM_TryBeginIntermissionBySize()
++{
++	std::string pick = MM_SelectSizedMap();
++	if (pick.empty())
++		return false; // disabled or nothing eligible -> fall through to g_map_list
++
++	BeginIntermission(CreateTargetChangeLevel(pick.c_str()));
++	return true;
++}
++
+ bool MM_TryBeginIntermissionFromMapList()
+ {
+ 	if (!muffmode::CvarString(g_map_list)[0])
+@@ -299,6 +368,73 @@ bool MM_TryBeginIntermissionFromMapList()
+ 	return false;
+ }
+ 
++// [KarmicP] Fallback map: when the g_map_list rotation produced no next map,
++// load g_default_map if set. Hooked BELOW the rotation in Match_End so votes,
++// force, mymap, size-logic, and the list all take precedence.
++bool MM_TryBeginIntermissionFromDefaultMap()
++{
++	std::string pick = MM_ResolveDefaultMap(muffmode::CvarStringView(g_default_map));
++	if (pick.empty() || !MM_IsSafeMapToken(pick.c_str()))
++		return false;
++
++	MuffModeLog("MAP", "Default map fallback: loading '%s'", pick.c_str());
++	BeginIntermission(CreateTargetChangeLevel(pick.c_str()));
++	return true;
++}
++
++// [KarmicP] Persist the admin's default-map choice to baseq2/defaultmap.cfg
++// (atomic temp+rename), mirroring the bans/ranks files. Written as exec-style
++// lines: the `set` line is parsed back by MM_DefaultMap_Load at InitGame, and
++// the `map` boot line makes `exec defaultmap.cfg` (issued by net.cfg after its
++// fallback `map`) boot the server into the saved pick. Saving here does NOT
++// change the current map.
++void MM_DefaultMap_Save(const char *token)
++{
++	if (!token)
++		token = "";
++	const char *k_default_map_file = "baseq2/defaultmap.cfg";
++	const std::filesystem::path path(k_default_map_file);
++	const std::filesystem::path tmp = std::filesystem::path(std::string(k_default_map_file) + ".tmp");
++	std::error_code ec;
++	std::filesystem::create_directories(path.parent_path(), ec);
++	{
++		std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++		if (!out)
++			return;
++		out << "set g_default_map \"" << token << "\"\n";
++		if (*token)
++			out << "map \"" << token << "\"\n";
++		if (!out.good())
++			return;
++	}
++	std::filesystem::rename(tmp, path, ec);
++	if (ec) {
++		// Windows rename fails if the target exists; replace it explicitly.
++		std::filesystem::remove(path, ec);
++		std::filesystem::rename(tmp, path, ec);
++	}
++}
++
++// [KarmicP] Load the persisted default map at InitGame and apply it to
++// g_default_map, overriding the net.cfg default so the admin's saved choice
++// wins. Missing/blank/unsafe -> leave g_default_map as configured.
++void MM_DefaultMap_Load()
++{
++	const char *k_default_map_file = "baseq2/defaultmap.cfg";
++	std::error_code ec;
++	if (!std::filesystem::exists(k_default_map_file, ec))
++		return;
++	std::ifstream in(k_default_map_file, std::ios::binary);
++	if (!in)
++		return;
++	std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
++	std::string token = MM_ParseDefaultMapConfig(contents);
++	if (token.empty() || !MM_IsSafeMapToken(token.c_str()))
++		return;
++	gi.cvar_forceset("g_default_map", token.c_str());
++	gi.Com_PrintFmt("MuffMode: default map '{}' loaded from {}\n", token, k_default_map_file);
++}
++
+ void MM_HandleMapShuffleCvarChange()
+ {
+ 	if (!g_map_list_shuffle)
+diff --git a/src/sgame/muffmode/mm_maps.h b/src/sgame/muffmode/mm_maps.h
+index a0f54731..5b6afb7f 100644
+--- a/src/sgame/muffmode/mm_maps.h
++++ b/src/sgame/muffmode/mm_maps.h
+@@ -21,6 +21,11 @@ bool MM_IsSafeMapToken(const char *mapname);
+ void MM_ShuffleMapList();
+ void MM_GametypeChangeMapFirst();
+ bool MM_TryBeginIntermissionFromMapList();
++std::string MM_SelectSizedMap();
++bool MM_TryBeginIntermissionBySize();
++bool MM_TryBeginIntermissionFromDefaultMap();
++void MM_DefaultMap_Save(const char *token); // [KarmicP] persist admin's default-map pick to defaultmap.cfg
++void MM_DefaultMap_Load();                  // [KarmicP] load it at InitGame (overrides net.cfg default)
+ void MM_HandleMapShuffleCvarChange();
+ 
+ // [MuffMode] MyMap queue (game.mapqueue state remains in game_locals_t).
+diff --git a/src/sgame/muffmode/mm_match.cpp b/src/sgame/muffmode/mm_match.cpp
+index 000f1196..3c2f35a6 100644
+--- a/src/sgame/muffmode/mm_match.cpp
++++ b/src/sgame/muffmode/mm_match.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under the GNU General Public License 2.0.
+ 
+ #include "g_local.h"
++#include "muffmode/mm_bots_rules.h"
+ #include "muffmode/mm_captain.h"
+ #include "muffmode/mm_command_contracts.h"
+ #include "muffmode/mm_duel.h"
+@@ -1436,6 +1437,52 @@ sgame/core/runtime.cpp. Order is load-bearing: warmup -> round -> countdown ->
+ match-end warning.
+ ================
+ */
++/*
++================
++TickBotFill  [KarmicP]
++
++Once g_bot_human_cutoff connected humans are present, force bot_minClients to 0
++and kick every bot so the game is human-only; below the cutoff, restore the
++server's original fill so bots return. Throttled to once a second — kicks are
++queued via AddCommandString, so re-running while bots are already gone is a
++no-op. See mm_bots_rules.h for the pure decision.
++================
++*/
++static void TickBotFill() {
++	if (!g_bot_human_cutoff || g_bot_human_cutoff->integer <= 0)
++		return;
++
++	static gtime_t next_check = 0_ms;
++	static int cached_fill = 0; // last non-zero bot_minClients we saw
++
++	if (level.time < next_check)
++		return;
++	next_check = level.time + 1_sec;
++
++	int humans = 0;
++	for (auto ec : active_clients()) {
++		if (ec->client->sess.is_a_bot || (ec->svflags & SVF_BOT))
++			continue;
++		if (!ClientIsPlaying(ec->client)) // only count humans in the match, not spectators
++			continue;
++		humans++;
++	}
++
++	cvar_t *bot_fill = gi.cvar("bot_minClients", "0", CVAR_NOFLAGS);
++
++	MM_BotFillDecision d = MM_DecideBotFill(humans, g_bot_human_cutoff->integer, bot_fill->integer, cached_fill);
++	cached_fill = d.cached_fill;
++
++	if (d.update_fill)
++		gi.cvar_forceset("bot_minClients", G_Fmt("{}", d.fill_value).data());
++
++	if (d.kick_bots) {
++		for (auto ec : active_clients())
++			if (ec->client->sess.is_a_bot || (ec->svflags & SVF_BOT))
++				gi.AddCommandString(G_Fmt("kick {}\n", ec - g_entities).data());
++	}
++}
++
+ void MM_Match_RunFrame() {
+ 	match::TickWarmupState();
+ 	match::TickWarmupWaitNudges();
+@@ -1443,6 +1490,7 @@ void MM_Match_RunFrame() {
+ 	match::TickRoundState();
+ 	match::TickCountdown();
+ 	match::TickMatchEndWarning();
++	TickBotFill();
+ }
+ 
+ /*
+diff --git a/src/sgame/muffmode/mm_menu.cpp b/src/sgame/muffmode/mm_menu.cpp
+index ce04d5bb..2b84d211 100644
+--- a/src/sgame/muffmode/mm_menu.cpp
++++ b/src/sgame/muffmode/mm_menu.cpp
+@@ -1,17 +1,25 @@
+ // Copyright (c) ZeniMax Media Inc.
+ // Licensed under the GNU General Public License 2.0.
+ #include "g_local.h"
++#include "muffmode/mm_bans.h"
+ #include "muffmode/mm_captain.h"
++#include "muffmode/mm_debug.h"
++#include "muffmode/mm_maps.h"
+ #include "muffmode/mm_match.h"
+ #include "muffmode/mm_menu.h"
++#include "muffmode/mm_pconfig.h"
++#include "muffmode/mm_ranks.h"
++#include "muffmode/mm_skin.h"
+ #include "muffmode/mm_team.h"
+ #include "muffmode/mm_util.h"
+ #include "muffmode/mm_vote_menu.h"
+ #include "monsters/m_player.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ namespace muffmode::menu {
+ 
+@@ -124,6 +132,10 @@ void OpenHost(gentity_t *ent, menu_hnd_t *p);
+ void OpenServer(gentity_t *ent, menu_hnd_t *p);
+ }
+ 
++namespace muffmode::menu::player_settings {
++void Open(gentity_t *ent, menu_hnd_t *p);
++}
++
+ namespace muffmode::menu::admin {
+ 
+ struct AdminSettings {
+@@ -375,15 +387,195 @@ void Cancel(gentity_t *ent, menu_hnd_t *p)
+ 	P_Menu_Close(ent);
+ }
+ 
+-menu_t admin_menu[] = {
+-	{ "*Administration Menu", MENU_ALIGN_CENTER, nullptr },
++// [KarmicP] Admin kick/ban player pickers. Each player row stores its client
++// slot in text_arg1; the select reads it back from p->entries[p->cur].
++static bool AdminMenuTarget(gentity_t *ent, menu_hnd_t *p, int &slot_out, gentity_t *&targ_out)
++{
++	if (!menu::HasClient(ent) || !ent->client->sess.admin)
++		return false;
++	if (!p || !p->entries || p->cur < 0 || p->cur >= p->num)
++		return false;
++	const char *s = p->entries[p->cur].text_arg1;
++	if (!s || !s[0])
++		return false;
++	int slot = 0;
++	for (const char *c = s; *c >= '0' && *c <= '9'; ++c)
++		slot = slot * 10 + (*c - '0');
++	if (slot < 1 || slot > static_cast<int>(game.maxclients))
++		return false;
++	gentity_t *targ = &g_entities[slot];
++	if (!targ->inuse || !targ->client || targ == &g_entities[1] || targ->client->sess.admin)
++		return false;
++	slot_out = slot;
++	targ_out = targ;
++	return true;
++}
++
++void KickSelected(gentity_t *ent, menu_hnd_t *p)
++{
++	int slot = 0;
++	gentity_t *targ = nullptr;
++	if (!AdminMenuTarget(ent, p, slot, targ))
++		return;
++	gi.LocBroadcast_Print(PRINT_HIGH, "{} was kicked.\n", targ->client->resp.netname);
++	gi.AddCommandString(G_Fmt("kick {}\n", slot).data());
++	P_Menu_Close(ent);
++}
++
++void BanSelected(gentity_t *ent, menu_hnd_t *p)
++{
++	int slot = 0;
++	gentity_t *targ = nullptr;
++	if (!AdminMenuTarget(ent, p, slot, targ))
++		return;
++	const char *sid = targ->client->pers.social_id;
++	if (targ->client->sess.is_a_bot || sid == nullptr || sid[0] == '\0') {
++		gi.LocBroadcast_Print(PRINT_HIGH, "{} was kicked (no social ID to ban).\n", targ->client->resp.netname);
++	} else {
++		MM_Bans_Add(sid, targ->client->resp.netname, "banned via admin menu");
++		gi.LocBroadcast_Print(PRINT_HIGH, "{} was banned.\n", targ->client->resp.netname);
++	}
++	gi.AddCommandString(G_Fmt("kick {}\n", slot).data());
++	P_Menu_Close(ent);
++}
++
++void FillPlayerList(gentity_t *admin_ent, menu_hnd_t *menu, SelectFunc_t action)
++{
++	int row = 2;
++	const int last = menu->num - 1; // the return row
++	for (int i = 1; i <= static_cast<int>(game.maxclients) && row < last; ++i) {
++		gentity_t *ec = &g_entities[i];
++		if (!ec->inuse || !ec->client)
++			continue;
++		if (ec == admin_ent || ec == &g_entities[1] || ec->client->sess.admin)
++			continue;
++		P_Menu_UpdateEntry(menu->entries + row, G_Fmt("{}: {}", i, ec->client->resp.netname).data(), MENU_ALIGN_LEFT, action);
++		muffmode::CopyString(menu->entries[row].text_arg1, G_Fmt("{}", i).data());
++		++row;
++	}
++	if (row == 2)
++		P_Menu_UpdateEntry(menu->entries + row, "(no players to list)", MENU_ALIGN_LEFT, nullptr);
++	P_Menu_Update(admin_ent);
++}
++
++menu_t kick_menu[] = {
++	{ "*Kick a Player", MENU_ALIGN_CENTER, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
+-	{ "Settings", MENU_ALIGN_LEFT, OpenSettings },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "$g_pc_return", MENU_ALIGN_LEFT, menu::info::ReturnToMain }
++};
++
++menu_t ban_menu[] = {
++	{ "*Ban a Player", MENU_ALIGN_CENTER, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "$g_pc_return", MENU_ALIGN_LEFT, menu::info::ReturnToMain }
++};
++
++void OpenKickList(gentity_t *ent, menu_hnd_t *p)
++{
++	if (!menu::HasClient(ent) || !ent->client->sess.admin)
++		return;
++	P_Menu_Close(ent);
++	menu_hnd_t *m = P_Menu_Open(ent, kick_menu, -1, muffmode::CountAsInt(kick_menu), nullptr, nullptr);
++	if (m)
++		FillPlayerList(ent, m, KickSelected);
++}
++
++void OpenBanList(gentity_t *ent, menu_hnd_t *p)
++{
++	if (!menu::HasClient(ent) || !ent->client->sess.admin)
++		return;
++	P_Menu_Close(ent);
++	menu_hnd_t *m = P_Menu_Open(ent, ban_menu, -1, muffmode::CountAsInt(ban_menu), nullptr, nullptr);
++	if (m)
++		FillPlayerList(ent, m, BanSelected);
++}
++
++// [KarmicP] Default-map picker. Each row stores its map token in text_arg1;
++// selecting records it as the persistent default (g_default_map + defaultmap.cfg).
++// It does NOT change the current map.
++void DefaultMapSelected(gentity_t *ent, menu_hnd_t *p)
++{
++	if (!menu::HasClient(ent) || !ent->client->sess.admin)
++		return;
++	if (!p || !p->entries || p->cur < 0 || p->cur >= p->num)
++		return;
++	const char *token = p->entries[p->cur].text_arg1;
++	if (!token || !token[0] || !MM_IsSafeMapToken(token))
++		return;
++	gi.cvar_forceset("g_default_map", token);
++	MM_DefaultMap_Save(token);
++	gi.LocBroadcast_Print(PRINT_HIGH, "Default map set to {} by admin (saved).\n", token);
++	P_Menu_Close(ent);
++}
++
++void FillMapList(gentity_t *admin_ent, menu_hnd_t *menu)
++{
++	int row = 2;
++	const int last = menu->num - 1; // the return row
++	std::vector<std::string> maps = muffmode::maps::CollectConfiguredMaps();
++	for (const std::string &m : maps) {
++		if (row >= last)
++			break;
++		P_Menu_UpdateEntry(menu->entries + row, m.c_str(), MENU_ALIGN_LEFT, DefaultMapSelected);
++		muffmode::CopyString(menu->entries[row].text_arg1, m.c_str());
++		++row;
++	}
++	if (row == 2)
++		P_Menu_UpdateEntry(menu->entries + row, "(no maps configured)", MENU_ALIGN_LEFT, nullptr);
++	if (maps.size() > static_cast<size_t>(last - 2))
++		MuffModeLog("MAP", "Default-map picker truncated: %d maps, %d slots",
++			static_cast<int>(maps.size()), last - 2);
++	P_Menu_Update(admin_ent);
++}
++
++// 19 entries: title + blank + 16 map rows (indices 2..17) + return.
++menu_t default_map_menu[] = {
++	{ "*Set Default Map", MENU_ALIGN_CENTER, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr }, { "", MENU_ALIGN_LEFT, nullptr },
++	{ "$g_pc_return", MENU_ALIGN_LEFT, menu::info::ReturnToMain }
++};
++
++void OpenDefaultMapList(gentity_t *ent, menu_hnd_t *p)
++{
++	if (!menu::HasClient(ent) || !ent->client->sess.admin)
++		return;
++	P_Menu_Close(ent);
++	menu_hnd_t *m = P_Menu_Open(ent, default_map_menu, -1, muffmode::CountAsInt(default_map_menu), nullptr, nullptr);
++	if (m)
++		FillMapList(ent, m);
++}
++
++menu_t admin_menu[] = {
++	{ "*Administration Menu", MENU_ALIGN_CENTER, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "Settings", MENU_ALIGN_LEFT, OpenSettings },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "Kick Player", MENU_ALIGN_LEFT, OpenKickList },
++	{ "Ban Player", MENU_ALIGN_LEFT, OpenBanList },
++	{ "Set Default Map", MENU_ALIGN_LEFT, OpenDefaultMapList },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
+ 	{ "", MENU_ALIGN_LEFT, nullptr },
+@@ -469,7 +661,17 @@ void Update(gentity_t *ent)
+ 	if (!menu::GetEntries(ent, &entries, &num_entries))
+ 		return;
+ 
+-	const auto &stats = ent->client->mstats;
++	// [KarmicP] client->mstats is never populated anywhere; source the live
++	// per-match counters from resp.mstats[] via MS_Value so this screen shows
++	// real values instead of all zeros. Field order matches client_match_stats_t.
++	const client_match_stats_t stats = {
++		static_cast<uint32_t>(MS_Value(ent->client, MSTAT_DMG_DEALT)),
++		static_cast<uint32_t>(MS_Value(ent->client, MSTAT_DMG_RECEIVED)),
++		static_cast<uint32_t>(MS_Value(ent->client, MSTAT_SHOTS)),
++		static_cast<uint32_t>(MS_Value(ent->client, MSTAT_HITS)),
++		static_cast<uint32_t>(MS_Value(ent->client, MSTAT_KILLS_TOTAL)),
++		static_cast<uint32_t>(MS_Value(ent->client, MSTAT_DEATHS_TOTAL)),
++	};
+ 	MenuWriter writer{ entries, num_entries };
+ 	std::array<char, MAX_INFO_VALUE> value = {};
+ 	menu::CopyHostPlayerName(value);
+@@ -530,6 +732,219 @@ void Open(gentity_t *ent, menu_hnd_t *p)
+ 
+ /*-----------------------------------------------------------------------*/
+ 
++namespace muffmode::menu::player_settings {
++
++void Update(gentity_t *ent);
++void ToggleShowId(gentity_t *ent, menu_hnd_t *p);
++void ToggleTimer(gentity_t *ent, menu_hnd_t *p);
++void ToggleFragMessages(gentity_t *ent, menu_hnd_t *p);
++void ToggleAnnouncer(gentity_t *ent, menu_hnd_t *p);
++void CycleKillBeep(gentity_t *ent, menu_hnd_t *p);
++void ToggleFollowKiller(gentity_t *ent, menu_hnd_t *p);
++void ToggleFollowLeader(gentity_t *ent, menu_hnd_t *p);
++void ToggleFollowPowerup(gentity_t *ent, menu_hnd_t *p);
++void CycleEnemySkin(gentity_t *ent, menu_hnd_t *p);
++void CycleTeamSkin(gentity_t *ent, menu_hnd_t *p);
++
++constexpr std::array<const char *, 4> kSkinChoices = {
++	"",
++	"male/grunt",
++	"female/athena",
++	"cyborg/oni911"
++};
++
++const menu_t kPlayerSettingsMenuTemplate[] = {
++	{ "*Player Settings", MENU_ALIGN_CENTER, nullptr },
++	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "*Display", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, ToggleShowId },
++	{ "", MENU_ALIGN_LEFT, ToggleTimer },
++	{ "", MENU_ALIGN_LEFT, ToggleFragMessages },
++	{ "", MENU_ALIGN_LEFT, ToggleAnnouncer },
++	{ "", MENU_ALIGN_LEFT, CycleKillBeep },
++	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "*Spectator", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, ToggleFollowKiller },
++	{ "", MENU_ALIGN_LEFT, ToggleFollowLeader },
++	{ "", MENU_ALIGN_LEFT, ToggleFollowPowerup },
++	{ "", MENU_ALIGN_LEFT, nullptr },
++	{ "*Skin Overrides", MENU_ALIGN_LEFT, nullptr },
++	{ "", MENU_ALIGN_LEFT, CycleEnemySkin },
++	{ "", MENU_ALIGN_LEFT, CycleTeamSkin },
++	{ "$g_pc_return", MENU_ALIGN_LEFT, menu::info::ReturnToMain }
++};
++
++int SkinChoiceIndex(std::string_view skin)
++{
++	for (int i = 0; i < static_cast<int>(kSkinChoices.size()); i++) {
++		if (skin == kSkinChoices[i])
++			return i;
++	}
++
++	return -1;
++}
++
++const char *NextSkinChoice(std::string_view skin)
++{
++	const int index = SkinChoiceIndex(skin);
++	if (index < 0)
++		return kSkinChoices[0];
++
++	return kSkinChoices[(index + 1) % kSkinChoices.size()];
++}
++
++std::string SkinValueText(const char *skin)
++{
++	if (!skin || !skin[0])
++		return "normal";
++
++	if (SkinChoiceIndex(skin) < 0)
++		return "custom";
++
++	return skin;
++}
++
++void ToggleBool(gentity_t *ent, menu_hnd_t *, mm_pconfig_bool_setting_t setting)
++{
++	if (!menu::HasClient(ent))
++		return;
++
++	if (MM_PConfigToggleBool(ent, setting))
++		P_Menu_Update(ent);
++}
++
++void ToggleShowId(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::show_id);
++}
++
++void ToggleTimer(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::show_timer);
++}
++
++void ToggleFragMessages(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::show_fragmessages);
++}
++
++void ToggleAnnouncer(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::use_expanded);
++}
++
++void CycleKillBeep(gentity_t *ent, menu_hnd_t *)
++{
++	if (!menu::HasClient(ent))
++		return;
++
++	if (MM_PConfigCycleKillBeep(ent))
++		P_Menu_Update(ent);
++}
++
++void ToggleFollowKiller(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::follow_killer);
++}
++
++void ToggleFollowLeader(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::follow_leader);
++}
++
++void ToggleFollowPowerup(gentity_t *ent, menu_hnd_t *p)
++{
++	ToggleBool(ent, p, mm_pconfig_bool_setting_t::follow_powerup);
++}
++
++void SetSkinChoice(gentity_t *ent, bool enemy, const char *skin)
++{
++	if (!menu::HasClient(ent))
++		return;
++
++	char *store = enemy ? ent->client->sess.pc.enemy_skin : ent->client->sess.pc.team_skin;
++	if (skin && skin[0])
++		Q_strlcpy(store, skin, MAX_QPATH);
++	else
++		store[0] = 0;
++
++	MM_ClientSavePConfigOrWarn(ent);
++	MM_RefreshSkinOverridesForViewer(ent);
++	P_Menu_Update(ent);
++}
++
++void CycleEnemySkin(gentity_t *ent, menu_hnd_t *)
++{
++	if (!menu::HasClient(ent) || !muffmode::CvarEnabled(g_allow_skin_overrides))
++		return;
++
++	SetSkinChoice(ent, true, NextSkinChoice(ent->client->sess.pc.enemy_skin));
++}
++
++void CycleTeamSkin(gentity_t *ent, menu_hnd_t *)
++{
++	if (!menu::HasClient(ent) || !muffmode::CvarEnabled(g_allow_skin_overrides) || GT(GT_DUEL))
++		return;
++
++	SetSkinChoice(ent, false, NextSkinChoice(ent->client->sess.pc.team_skin));
++}
++
++void SetBoolRow(menu_t *entry, const char *label, mm_pconfig_bool_setting_t setting, SelectFunc_t select, gentity_t *ent)
++{
++	P_Menu_UpdateEntry(entry, G_Fmt("{}: {}", label, MM_PConfigBoolText(MM_PConfigGetBool(ent, setting))).data(), MENU_ALIGN_LEFT, select);
++}
++
++void Update(gentity_t *ent)
++{
++	menu_t *entries = nullptr;
++	int num_entries = 0;
++	if (!menu::GetEntries(ent, &entries, &num_entries) || num_entries < muffmode::CountAsInt(kPlayerSettingsMenuTemplate))
++		return;
++
++	SetBoolRow(entries + 3, "ID display", mm_pconfig_bool_setting_t::show_id, ToggleShowId, ent);
++	SetBoolRow(entries + 4, "Match timer", mm_pconfig_bool_setting_t::show_timer, ToggleTimer, ent);
++	SetBoolRow(entries + 5, "Frag messages", mm_pconfig_bool_setting_t::show_fragmessages, ToggleFragMessages, ent);
++	SetBoolRow(entries + 6, "Announcer", mm_pconfig_bool_setting_t::use_expanded, ToggleAnnouncer, ent);
++	P_Menu_UpdateEntry(entries + 7, G_Fmt("Kill beep: {}", MM_PConfigKillBeepName(ent->client->sess.pc.killbeep_num)).data(), MENU_ALIGN_LEFT, CycleKillBeep);
++
++	SetBoolRow(entries + 10, "Follow killer", mm_pconfig_bool_setting_t::follow_killer, ToggleFollowKiller, ent);
++	SetBoolRow(entries + 11, "Follow leader", mm_pconfig_bool_setting_t::follow_leader, ToggleFollowLeader, ent);
++	SetBoolRow(entries + 12, "Follow powerup", mm_pconfig_bool_setting_t::follow_powerup, ToggleFollowPowerup, ent);
++
++	if (!muffmode::CvarEnabled(g_allow_skin_overrides)) {
++		P_Menu_UpdateEntry(entries + 15, "Skin overrides: disabled", MENU_ALIGN_LEFT, nullptr);
++		P_Menu_UpdateEntry(entries + 16, "", MENU_ALIGN_LEFT, nullptr);
++		return;
++	}
++
++	P_Menu_UpdateEntry(entries + 15,
++		G_Fmt("{} skin: {}", GT(GT_DUEL) ? "Opp" : "Enemy", SkinValueText(ent->client->sess.pc.enemy_skin)).data(),
++		MENU_ALIGN_LEFT,
++		CycleEnemySkin);
++
++	if (GT(GT_DUEL)) {
++		P_Menu_UpdateEntry(entries + 16, "Team skin: unavailable", MENU_ALIGN_LEFT, nullptr);
++	} else {
++		P_Menu_UpdateEntry(entries + 16,
++			G_Fmt("Team skin: {}", SkinValueText(ent->client->sess.pc.team_skin)).data(),
++			MENU_ALIGN_LEFT,
++			CycleTeamSkin);
++	}
++}
++
++void Open(gentity_t *ent, menu_hnd_t *)
++{
++	if (!menu::HasClient(ent))
++		return;
++
++	P_Menu_Close(ent);
++	P_Menu_Open(ent, kPlayerSettingsMenuTemplate, -1, muffmode::CountAsInt(kPlayerSettingsMenuTemplate), nullptr, Update);
++}
++
++} // namespace muffmode::menu::player_settings
++
++/*-----------------------------------------------------------------------*/
++
+ namespace muffmode::menu::join {
+ 
+ void JoinFree(gentity_t *ent, menu_hnd_t *)
+@@ -571,17 +986,19 @@ constexpr int kTeamsChase = 8;
+ constexpr int kTeamsReadyUp = 9;
+ constexpr int kTeamsPlayerStats = 12;
+ constexpr int kTeamsCallVote = 13;
+-constexpr int kTeamsAdmin = 14;
++constexpr int kTeamsPlayerSettings = 14;
++constexpr int kTeamsAdmin = 15; // [KarmicP] Match/All-Time Scoreboard rows removed -> Admin back to 15
+ 
+ constexpr int kFreeJoin = 5;
+ constexpr int kFreeChase = 8;
+ constexpr int kFreeReadyUp = 9;
+ constexpr int kFreePlayerStats = 12;
+ constexpr int kFreeCallVote = 13;
+-constexpr int kFreeAdmin = 14;
++constexpr int kFreePlayerSettings = 14;
++constexpr int kFreeAdmin = 15; // [KarmicP] see kTeamsAdmin
+ 
+-constexpr int kGameMod = 16;
+-constexpr int kNotice = 17;
++constexpr int kGameMod = 16;     // [KarmicP] footer line 1 (Karmic fork + version)
++constexpr int kGameModBase = 17; // [KarmicP] footer line 2 (base MuffMode version)
+ 
+ const menu_t kTeamsMenuTemplate[] = {
+ 	{ "", MENU_ALIGN_CENTER, nullptr },
+@@ -598,10 +1015,10 @@ const menu_t kTeamsMenuTemplate[] = {
+ 	{ "Match Info", MENU_ALIGN_LEFT, menu::info::OpenServer },
+ 	{ "Player Stats", MENU_ALIGN_LEFT, menu::stats::Open },
+ 	{ "Call a Vote", MENU_ALIGN_LEFT, ::G_Menu_CallVote },
+-	{ "", MENU_ALIGN_LEFT, nullptr },
+-	{ "", MENU_ALIGN_LEFT, nullptr },
+-	{ "", MENU_ALIGN_CENTER, nullptr },
+-	{ "", MENU_ALIGN_CENTER, nullptr }
++	{ "Player Settings", MENU_ALIGN_LEFT, menu::player_settings::Open },
++	{ "", MENU_ALIGN_LEFT, nullptr },    // 15 Admin (set dynamically)
++	{ "", MENU_ALIGN_CENTER, nullptr },  // 16 gamemod name (Karmic, line 1)
++	{ "", MENU_ALIGN_CENTER, nullptr }   // 17 base mod version (MuffMode, line 2)
+ };
+ 
+ const menu_t kFreeMenuTemplate[] = {
+@@ -619,10 +1036,10 @@ const menu_t kFreeMenuTemplate[] = {
+ 	{ "Match Info", MENU_ALIGN_LEFT, menu::info::OpenServer },
+ 	{ "Player Stats", MENU_ALIGN_LEFT, menu::stats::Open },
+ 	{ "Call a Vote", MENU_ALIGN_LEFT, ::G_Menu_CallVote },
+-	{ "", MENU_ALIGN_LEFT, nullptr },
+-	{ "", MENU_ALIGN_LEFT, nullptr },
+-	{ "", MENU_ALIGN_CENTER, nullptr },
+-	{ "", MENU_ALIGN_CENTER, nullptr }
++	{ "Player Settings", MENU_ALIGN_LEFT, menu::player_settings::Open },
++	{ "", MENU_ALIGN_LEFT, nullptr },    // 15 Admin (set dynamically)
++	{ "", MENU_ALIGN_CENTER, nullptr },  // 16 gamemod name (Karmic, line 1)
++	{ "", MENU_ALIGN_CENTER, nullptr }   // 17 base mod version (MuffMode, line 2)
+ };
+ 
+ } // namespace muffmode::menu::join
+@@ -1049,7 +1466,7 @@ void Update(gentity_t *ent)
+ {
+ 	menu_t *entries = nullptr;
+ 	int num_entries = 0;
+-	if (!menu::GetEntries(ent, &entries, &num_entries) || num_entries <= kNotice)
++	if (!menu::GetEntries(ent, &entries, &num_entries) || num_entries <= kGameModBase)
+ 		return;
+ 
+ 	const int max_players = max(1, muffmode::CvarInteger(maxplayers));
+@@ -1190,6 +1607,12 @@ void Update(gentity_t *ent)
+ 	}
+ 
+ 	menu::SetGamemodName(entries + kGameMod);
++	menu::SetText(entries[kGameModBase], G_Fmt("MuffMode v{}", GAMEMOD_VERSION).data());
++
++	int player_settings_index = teams ? kTeamsPlayerSettings : kFreePlayerSettings;
++	menu::SetText(entries[player_settings_index], "Player Settings");
++	entries[player_settings_index].align = MENU_ALIGN_LEFT;
++	entries[player_settings_index].SelectFunc = menu::player_settings::Open;
+ 
+ 	int admin_index = teams ? kTeamsAdmin : kFreeAdmin;
+ 	if (ent->client->sess.admin) {
+@@ -1200,8 +1623,6 @@ void Update(gentity_t *ent)
+ 		menu::SetText(entries[admin_index], "");
+ 		entries[admin_index].SelectFunc = nullptr;
+ 	}
+-
+-	menu::SetText(entries[kNotice], "www.darkmatter-quake.com");
+ }
+ 
+ void Open(gentity_t *ent)
+diff --git a/src/sgame/muffmode/mm_pconfig.cpp b/src/sgame/muffmode/mm_pconfig.cpp
+index 6680f883..9f12940b 100644
+--- a/src/sgame/muffmode/mm_pconfig.cpp
++++ b/src/sgame/muffmode/mm_pconfig.cpp
+@@ -4,13 +4,19 @@
+ #include "g_local.h"
+ #include "muffmode/mm_command_contracts.h"
+ #include "muffmode/mm_pconfig.h"
++#include "muffmode/mm_pconfig_rules.h"
+ #include "muffmode/mm_parse.h"
++#include "muffmode/mm_skin.h"
+ #include "muffmode/mm_util.h"
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstdio>
+ #include <filesystem>
++#include <iterator>
++#include <optional>
+ #include <string>
++#include <string_view>
+ 
+ //=======================================================================
+ // PLAYER CONFIGS
+@@ -19,12 +25,49 @@
+ namespace muffmode::pconfig {
+ 
+ constexpr long k_max_player_config_file_length = 0x40000;
+-
+-bool IsSafeSocialIdChar(char c)
+-{
+-	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+-		(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+-}
++constexpr const char *k_player_config_dir = "baseq2/pcfg";
++constexpr size_t k_max_player_config_stem_length = 251; // 255 minus ".cfg".
++
++enum class config_line_result_t {
++	ignored,
++	applied,
++	invalid
++};
++
++enum class save_result_t {
++	saved,
++	session_only,
++	failed,
++	skipped
++};
++
++struct config_load_stats_t {
++	int applied = 0;
++	int invalid = 0;
++	uint32_t loaded_fields = 0;
++};
++
++constexpr uint32_t k_config_field_show_id = bit_v<0>;
++constexpr uint32_t k_config_field_show_timer = bit_v<1>;
++constexpr uint32_t k_config_field_show_fragmessages = bit_v<2>;
++constexpr uint32_t k_config_field_use_expanded = bit_v<3>;
++constexpr uint32_t k_config_field_killbeep = bit_v<4>;
++constexpr uint32_t k_config_field_follow_killer = bit_v<5>;
++constexpr uint32_t k_config_field_follow_leader = bit_v<6>;
++constexpr uint32_t k_config_field_follow_powerup = bit_v<7>;
++constexpr uint32_t k_config_field_enemy_skin = bit_v<8>;
++constexpr uint32_t k_config_field_team_skin = bit_v<9>;
++constexpr uint32_t k_all_config_fields =
++	k_config_field_show_id |
++	k_config_field_show_timer |
++	k_config_field_show_fragmessages |
++	k_config_field_use_expanded |
++	k_config_field_killbeep |
++	k_config_field_follow_killer |
++	k_config_field_follow_leader |
++	k_config_field_follow_powerup |
++	k_config_field_enemy_skin |
++	k_config_field_team_skin;
+ 
+ int ClientSlotNumber(const gentity_t *ent)
+ {
+@@ -35,102 +78,61 @@ int ClientSlotNumber(const gentity_t *ent)
+ 	return static_cast<int>(ent->s.number - 1);
+ }
+ 
+-std::string FallbackSocialId(const char *prefix, const gentity_t *ent)
++const char *BoolText(bool value) noexcept
+ {
+-	return fmt::format("{}_{}", prefix && *prefix ? prefix : "client", ClientSlotNumber(ent));
++	return value ? "ON" : "OFF";
+ }
+ 
+-bool IsReservedWindowsDeviceName(const char *name)
++int BoolInt(bool value) noexcept
+ {
+-	if (!name || !*name)
+-		return false;
++	return value ? 1 : 0;
++}
+ 
+-	std::string stem;
+-	stem.reserve(MAX_INFO_VALUE - 1);
+-	for (const char *p = name; *p && *p != '.' && stem.size() < MAX_INFO_VALUE - 1; p++)
+-		stem += *p;
++constexpr std::array<const char *, 5> k_kill_beep_names = { "off", "clang", "beep-boop", "insane", "tang-tang" };
+ 
+-	if (stem.empty())
++bool RequireCommandArgc(gentity_t *ent, int min_expected, int max_expected, const char *usage)
++{
++	if (!ent || !ent->client)
+ 		return false;
+ 
+-	static constexpr std::array<const char *, 22> reserved_names = {{
+-		"CON", "PRN", "AUX", "NUL",
+-		"COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+-		"LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"
+-	}};
+-
+-	for (const char *reserved : reserved_names) {
+-		if (muffmode::CStringEqualsI(stem.c_str(), reserved))
+-			return true;
+-	}
++	if (MM_IsArgcInRangeValid(gi.argc(), min_expected, max_expected))
++		return true;
+ 
++	gi.LocClient_Print(ent, PRINT_HIGH, "Usage: {}\n", usage);
+ 	return false;
+ }
+ 
+-std::string SanitizeSocialId(const char *src)
+-{
+-	if (!src)
+-		return {};
+-
+-	std::string out;
+-	out.reserve(MAX_INFO_VALUE - 1);
+-
+-	for (const char *cursor = src; *cursor && out.size() < MAX_INFO_VALUE - 1; cursor++) {
+-		const char c = *cursor;
+-		// Allow alphanumeric, dash, underscore, and common ID characters.
+-		// Skip leading dots to avoid ambiguous Windows device/path spellings.
+-		if (IsSafeSocialIdChar(c) && (c != '.' || !out.empty()))
+-			out += c;
+-	}
+-
+-	while (!out.empty() && out.back() == '.')
+-		out.pop_back();
+-
+-	return out;
+-}
+-
+-std::string SanitizeConfigCommentText(const char *text)
++std::optional<bool> ReadOptionalBoolCommandArg(gentity_t *ent, bool current_value)
+ {
+-	if (!text || !*text)
+-		return "Player";
++	if (!RequireCommandArgc(ent, 1, 2, G_Fmt("{} [0|1|on|off]", gi.argv(0)).data()))
++		return std::nullopt;
+ 
+-	std::string out;
+-	for (const unsigned char *p = reinterpret_cast<const unsigned char *>(text); *p && out.size() < MAX_INFO_VALUE - 1; p++) {
+-		if (*p < ' ' || *p == 0x7F) {
+-			if (!out.empty() && out.back() != ' ')
+-				out += ' ';
+-			continue;
+-		}
++	if (gi.argc() == 1)
++		return !current_value;
+ 
+-		out += static_cast<char>(*p);
++	const auto parsed = ParseBoolToken(gi.argv(1));
++	if (!parsed) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Invalid {} value. Use on/off or 1/0.\n", gi.argv(0));
++		return std::nullopt;
+ 	}
+ 
+-	while (!out.empty() && out.back() == ' ')
+-		out.pop_back();
+-
+-	return out.empty() ? "Player" : out;
++	return parsed;
+ }
+ 
+-bool RequireCommandArgc(gentity_t *ent, int min_expected, int max_expected, const char *usage)
++bool SetBoolPreference(gentity_t *ent, mm_pconfig_bool_setting_t setting, const char *label)
+ {
+-	if (!ent || !ent->client)
++	const auto value = ReadOptionalBoolCommandArg(ent, MM_PConfigGetBool(ent, setting));
++	if (!value)
+ 		return false;
+ 
+-	if (MM_IsArgcInRangeValid(gi.argc(), min_expected, max_expected))
+-		return true;
+-
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Usage: {}\n", usage);
+-	return false;
+-}
+-
+-bool RequireNoCommandArgs(gentity_t *ent)
+-{
+-	return RequireCommandArgc(ent, 1, 1, gi.argv(0));
++	MM_PConfigSetBool(ent, setting, *value);
++	gi.LocClient_Print(ent, PRINT_HIGH, "{}: {}\n", label, BoolText(*value));
++	return true;
+ }
+ 
+ bool EnsureDirectory()
+ {
+-	const std::filesystem::path dir("baseq2/pcfg");
++	const std::filesystem::path dir(k_player_config_dir);
+ 	std::error_code error;
+ 
+ 	std::filesystem::create_directories(dir, error);
+@@ -148,87 +150,571 @@ bool EnsureDirectory()
+ 	return true;
+ }
+ 
+-bool ValidateReadableConfig(FILE *file)
++std::optional<std::filesystem::path> ConfigPathForClient(gentity_t *ent, bool log_failure)
++{
++	if (!ent || !ent->client || (ent->svflags & SVF_BOT))
++		return std::nullopt;
++
++	if (!ent->client->pers.social_id[0]) {
++		if (log_failure)
++			gi.Com_PrintFmt("{}: Cannot load player config for client {} without a stable social ID.\n", __FUNCTION__, ClientSlotNumber(ent));
++		return std::nullopt;
++	}
++
++	const std::string_view social_id(ent->client->pers.social_id);
++	const auto config_stem = EncodeSocialIdConfigStem(social_id, MAX_INFO_VALUE - 1, k_max_player_config_stem_length);
++	if (!config_stem) {
++		if (log_failure)
++			gi.Com_PrintFmt("{}: Cannot load player config for unsupported social ID on client {}.\n", __FUNCTION__, ClientSlotNumber(ent));
++		return std::nullopt;
++	}
++
++	return std::filesystem::path(k_player_config_dir) / (*config_stem + ".cfg");
++}
++
++std::optional<std::string> ReadConfigText(FILE *file)
+ {
+ 	if (std::fseek(file, 0, SEEK_END) != 0)
+-		return false;
++		return std::nullopt;
+ 
+ 	const long file_length = std::ftell(file);
+ 	if (file_length < 0 || file_length > k_max_player_config_file_length)
+-		return false;
++		return std::nullopt;
+ 
+ 	if (std::fseek(file, 0, SEEK_SET) != 0)
+-		return false;
++		return std::nullopt;
+ 
+ 	std::string buffer(static_cast<size_t>(file_length), '\0');
+ 	if (!buffer.empty()) {
+ 		const size_t read_length = std::fread(&buffer[0], 1, buffer.size(), file);
+ 		if (read_length != buffer.size())
+-			return false;
++			return std::nullopt;
+ 	}
+ 
+-	return true;
++	return buffer;
++}
++
++std::string_view StripConfigComment(std::string_view line)
++{
++	size_t comment = std::string_view::npos;
++	const auto mark_comment = [&comment](size_t pos) {
++		if (pos != std::string_view::npos)
++			comment = comment == std::string_view::npos ? pos : std::min(comment, pos);
++	};
++
++	mark_comment(line.find("//"));
++	mark_comment(line.find('#'));
++	mark_comment(line.find(';'));
++
++	if (comment != std::string_view::npos)
++		line = line.substr(0, comment);
++
++	return MM_TrimAsciiWhitespace(line);
++}
++
++bool ReadSingleArg(std::string_view args, std::string_view &value)
++{
++	args = MM_TrimAsciiWhitespace(args);
++	if (args.empty())
++		return false;
++
++	const size_t split = args.find_first_of(" \t\r\n\v\f");
++	if (split == std::string_view::npos) {
++		value = args;
++		return true;
++	}
++
++	value = args.substr(0, split);
++	return MM_TrimAsciiWhitespace(args.substr(split)).empty();
++}
++
++config_line_result_t ApplyBoolLine(bool &field, std::string_view args, const char *name, int line_number)
++{
++	std::string_view value;
++	if (!ReadSingleArg(args, value)) {
++		gi.Com_PrintFmt("{}:{}: expected one boolean value.\n", name, line_number);
++		return config_line_result_t::invalid;
++	}
++
++	const auto parsed = ParseBoolToken(value);
++	if (!parsed) {
++		gi.Com_PrintFmt("{}:{}: invalid boolean value \"{}\".\n", name, line_number, std::string(value));
++		return config_line_result_t::invalid;
++	}
++
++	field = *parsed;
++	return config_line_result_t::applied;
++}
++
++config_line_result_t ApplyKillBeepLine(client_config_t &config, std::string_view args, const char *name, int line_number)
++{
++	std::string_view value;
++	if (!ReadSingleArg(args, value)) {
++		gi.Com_PrintFmt("{}:{}: expected one kill beep value.\n", name, line_number);
++		return config_line_result_t::invalid;
++	}
++
++	const auto parsed = ParseKillBeepToken(value);
++	if (!parsed) {
++		gi.Com_PrintFmt("{}:{}: invalid kill beep value \"{}\"; use 0-4 or a named beep.\n", name, line_number, std::string(value));
++		return config_line_result_t::invalid;
++	}
++
++	config.killbeep_num = *parsed;
++	return config_line_result_t::applied;
++}
++
++config_line_result_t ApplySkinLine(char (&store)[MAX_QPATH], std::string_view args, const char *name, int line_number)
++{
++	std::string_view value;
++	if (!ReadSingleArg(args, value)) {
++		gi.Com_PrintFmt("{}:{}: expected one skin value.\n", name, line_number);
++		return config_line_result_t::invalid;
++	}
++
++	if (IsDisableToken(value)) {
++		store[0] = 0;
++		return config_line_result_t::applied;
++	}
++
++	if (!IsSafeSkinPath(value)) {
++		gi.Com_PrintFmt("{}:{}: invalid skin path \"{}\".\n", name, line_number, std::string(value));
++		return config_line_result_t::invalid;
++	}
++
++	if (!IsStorableSkinPath(value, MAX_QPATH, MAX_NETNAME - 1, CS_SIZE(CS_PLAYERSKINS))) {
++		gi.Com_PrintFmt("{}:{}: skin path \"{}\" is too long.\n", name, line_number, std::string(value));
++		return config_line_result_t::invalid;
++	}
++
++	muffmode::CopyString(store, value);
++	return config_line_result_t::applied;
++}
++
++config_line_result_t ApplyConfigLine(client_config_t &config, std::string_view raw_line, const char *name, int line_number, uint32_t &loaded_fields)
++{
++	const std::string_view line = StripConfigComment(raw_line);
++	if (line.empty())
++		return config_line_result_t::ignored;
++
++	const size_t split = line.find_first_of(" \t\r\n\v\f");
++	const std::string_view command = split == std::string_view::npos ? line : line.substr(0, split);
++	const std::string_view args = split == std::string_view::npos ? std::string_view() : line.substr(split);
++	const auto apply_known = [&loaded_fields](uint32_t field, config_line_result_t result) {
++		if (result == config_line_result_t::applied)
++			loaded_fields |= field;
++		return result;
++	};
++
++	if (EqualsI(command, "id") || EqualsI(command, "crosshairid"))
++		return apply_known(k_config_field_show_id, ApplyBoolLine(config.show_id, args, name, line_number));
++	if (EqualsI(command, "timer"))
++		return apply_known(k_config_field_show_timer, ApplyBoolLine(config.show_timer, args, name, line_number));
++	if (EqualsI(command, "fm") || EqualsI(command, "fragmessages"))
++		return apply_known(k_config_field_show_fragmessages, ApplyBoolLine(config.show_fragmessages, args, name, line_number));
++	if (EqualsI(command, "announcer"))
++		return apply_known(k_config_field_use_expanded, ApplyBoolLine(config.use_expanded, args, name, line_number));
++	if (EqualsI(command, "followkiller"))
++		return apply_known(k_config_field_follow_killer, ApplyBoolLine(config.follow_killer, args, name, line_number));
++	if (EqualsI(command, "followleader"))
++		return apply_known(k_config_field_follow_leader, ApplyBoolLine(config.follow_leader, args, name, line_number));
++	if (EqualsI(command, "followpowerup"))
++		return apply_known(k_config_field_follow_powerup, ApplyBoolLine(config.follow_powerup, args, name, line_number));
++	if (EqualsI(command, "kb") || EqualsI(command, "killbeep"))
++		return apply_known(k_config_field_killbeep, ApplyKillBeepLine(config, args, name, line_number));
++	if (EqualsI(command, "eskin") || EqualsI(command, "enemyskin"))
++		return apply_known(k_config_field_enemy_skin, ApplySkinLine(config.enemy_skin, args, name, line_number));
++	if (EqualsI(command, "tskin") || EqualsI(command, "teamskin"))
++		return apply_known(k_config_field_team_skin, ApplySkinLine(config.team_skin, args, name, line_number));
++
++	gi.Com_PrintFmt("{}:{}: ignoring unknown player config command \"{}\".\n", name, line_number, std::string(command));
++	return config_line_result_t::invalid;
++}
++
++config_load_stats_t ApplyConfigText(client_config_t &config, std::string_view text, const char *name)
++{
++	config_load_stats_t stats;
++	int line_number = 1;
++	size_t line_start = 0;
++
++	while (line_start <= text.size()) {
++		size_t line_end = text.find('\n', line_start);
++		std::string_view line = line_end == std::string_view::npos
++			? text.substr(line_start)
++			: text.substr(line_start, line_end - line_start);
++		if (!line.empty() && line.back() == '\r')
++			line.remove_suffix(1);
++
++		const config_line_result_t result = ApplyConfigLine(config, line, name, line_number, stats.loaded_fields);
++		if (result == config_line_result_t::applied)
++			stats.applied++;
++		else if (result == config_line_result_t::invalid)
++			stats.invalid++;
++
++		if (line_end == std::string_view::npos)
++			break;
++
++		line_start = line_end + 1;
++		line_number++;
++	}
++
++	if (stats.invalid > 0) {
++		gi.Com_PrintFmt("{}: Loaded {} player config setting{} from \"{}\" with {} invalid line{}.\n",
++			__FUNCTION__, stats.applied, stats.applied == 1 ? "" : "s", name, stats.invalid, stats.invalid == 1 ? "" : "s");
++	}
++
++	return stats;
++}
++
++bool ShouldRewriteConfig(const config_load_stats_t &stats)
++{
++	return stats.invalid > 0 || (stats.loaded_fields & k_all_config_fields) != k_all_config_fields;
++}
++
++std::string RenderConfigText(gentity_t *ent)
++{
++	const client_config_t &config = ent->client->sess.pc;
++	const std::string player_name = SanitizeConfigCommentText(ent->client->resp.netname, MAX_INFO_VALUE - 1);
++	std::string text = fmt::format(
++		"// {}'s Player Config\n"
++		"// Generated by MuffMode. Boolean values accept 1/0 or on/off.\n\n",
++		player_name);
++
++	fmt::format_to(std::back_inserter(text), FMT_STRING("id {}\n"), BoolInt(config.show_id));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("timer {}\n"), BoolInt(config.show_timer));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("fm {}\n"), BoolInt(config.show_fragmessages));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("announcer {}\n"), BoolInt(config.use_expanded));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("kb {}\n"), config.killbeep_num);
++	fmt::format_to(std::back_inserter(text), FMT_STRING("followkiller {}\n"), BoolInt(config.follow_killer));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("followleader {}\n"), BoolInt(config.follow_leader));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("followpowerup {}\n"), BoolInt(config.follow_powerup));
++	fmt::format_to(std::back_inserter(text), FMT_STRING("eskin {}\n"), config.enemy_skin[0] ? config.enemy_skin : "off");
++	fmt::format_to(std::back_inserter(text), FMT_STRING("tskin {}\n"), config.team_skin[0] ? config.team_skin : "off");
++	return text;
++}
++
++bool WriteTextFileAtomically(const std::filesystem::path &path, std::string_view text)
++{
++	std::filesystem::path temp_path = path;
++	temp_path += ".tmp";
++	const auto remove_temp = [&temp_path]() {
++		std::error_code remove_error;
++		std::filesystem::remove(temp_path, remove_error);
++	};
++
++	const std::string temp_name = temp_path.string();
++	auto file = muffmode::OpenFile(temp_name.c_str(), "wb");
++	if (!file)
++		return false;
++
++	if (!text.empty() && std::fwrite(text.data(), 1, text.size(), file.get()) != text.size()) {
++		file.reset();
++		remove_temp();
++		return false;
++	}
++
++	if (std::fflush(file.get()) != 0) {
++		file.reset();
++		remove_temp();
++		return false;
++	}
++
++	file.reset();
++
++	std::error_code error;
++	std::filesystem::rename(temp_path, path, error);
++	if (error) {
++		error.clear();
++		std::filesystem::copy_file(temp_path, path, std::filesystem::copy_options::overwrite_existing, error);
++		std::error_code remove_error;
++		std::filesystem::remove(temp_path, remove_error);
++	}
++
++	return !error;
++}
++
++void ClearQueuedFollowTarget(gentity_t *ent)
++{
++	if (!ent || !ent->client)
++		return;
++
++	ent->client->follow_queued_target = nullptr;
++	ent->client->follow_queued_time = 0_sec;
++}
++
++save_result_t SavePConfig(gentity_t *ent, bool log_success)
++{
++	if (!ent || !ent->client || (ent->svflags & SVF_BOT))
++		return save_result_t::skipped;
++
++	const auto path = ConfigPathForClient(ent, false);
++	if (!path)
++		return save_result_t::session_only;
++
++	if (!EnsureDirectory())
++		return save_result_t::failed;
++
++	const std::string config_text = RenderConfigText(ent);
++	if (!WriteTextFileAtomically(*path, config_text)) {
++		gi.Com_PrintFmt("{}: Player config write error: \"{}\"\n", __FUNCTION__, path->string());
++		return save_result_t::failed;
++	}
++
++	if (log_success)
++		gi.Com_PrintFmt("{}: Player config written to: \"{}\"\n", __FUNCTION__, path->string());
++
++	return save_result_t::saved;
++}
++
++void WarnSaveResult(gentity_t *ent, save_result_t result)
++{
++	if (!ent || !ent->client)
++		return;
++
++	switch (result) {
++	case save_result_t::session_only:
++		gi.LocClient_Print(ent, PRINT_HIGH, "Preference changed for this session only.\n");
++		break;
++	case save_result_t::failed:
++		gi.LocClient_Print(ent, PRINT_HIGH, "Preference changed for this session only; it could not be saved.\n");
++		break;
++	default:
++		break;
++	}
++}
++
++gentity_t *ClientEntityForClientIndex(int client_index)
++{
++	if (client_index < 0 || static_cast<size_t>(client_index) >= static_cast<size_t>(game.maxclients))
++		return nullptr;
++
++	const size_t entity_index = static_cast<size_t>(client_index) + 1;
++	const size_t client_entity_count = std::min(static_cast<size_t>(globals.num_entities), static_cast<size_t>(game.maxclients) + 1);
++	if (entity_index >= client_entity_count)
++		return nullptr;
++
++	return &g_entities[entity_index];
++}
++
++void ApplyLoadedConfigEffects(gentity_t *ent)
++{
++	if (!ent || !ent->client)
++		return;
++
++	if (ent->client->sess.pc.follow_leader && (!ClientIsPlaying(ent->client) || ent->client->eliminated)) {
++		gentity_t *leader = level.num_playing_clients > 0 ? ClientEntityForClientIndex(level.sorted_clients[0]) : nullptr;
++		if (leader && leader->inuse && leader->client && ClientIsPlaying(leader->client)) {
++			ent->client->follow_queued_target = leader;
++			ent->client->follow_queued_time = level.time;
++		}
++	}
++
++	MM_RefreshSkinOverridesForViewer(ent);
+ }
+ 
+ } // namespace muffmode::pconfig
+ 
++namespace {
++
++bool *MM_PConfigBoolField(gentity_t *ent, mm_pconfig_bool_setting_t setting)
++{
++	if (!ent || !ent->client)
++		return nullptr;
++
++	client_config_t &config = ent->client->sess.pc;
++	switch (setting) {
++	case mm_pconfig_bool_setting_t::show_id:
++		return &config.show_id;
++	case mm_pconfig_bool_setting_t::show_timer:
++		return &config.show_timer;
++	case mm_pconfig_bool_setting_t::show_fragmessages:
++		return &config.show_fragmessages;
++	case mm_pconfig_bool_setting_t::use_expanded:
++		return &config.use_expanded;
++	case mm_pconfig_bool_setting_t::follow_killer:
++		return &config.follow_killer;
++	case mm_pconfig_bool_setting_t::follow_leader:
++		return &config.follow_leader;
++	case mm_pconfig_bool_setting_t::follow_powerup:
++		return &config.follow_powerup;
++	}
++
++	return nullptr;
++}
++
++const bool *MM_PConfigBoolField(const gentity_t *ent, mm_pconfig_bool_setting_t setting)
++{
++	return MM_PConfigBoolField(const_cast<gentity_t *>(ent), setting);
++}
++
++gentity_t *MM_PConfigLeader()
++{
++	return level.num_playing_clients > 0 ? muffmode::pconfig::ClientEntityForClientIndex(level.sorted_clients[0]) : nullptr;
++}
++
++void MM_PConfigApplyBoolEffects(gentity_t *ent, mm_pconfig_bool_setting_t setting, bool value)
++{
++	if (!ent || !ent->client)
++		return;
++
++	if (setting == mm_pconfig_bool_setting_t::follow_killer && !value) {
++		muffmode::pconfig::ClearQueuedFollowTarget(ent);
++		return;
++	}
++
++	if (setting != mm_pconfig_bool_setting_t::follow_leader)
++		return;
++
++	if (!value) {
++		muffmode::pconfig::ClearQueuedFollowTarget(ent);
++		return;
++	}
++
++	gentity_t *leader = MM_PConfigLeader();
++	if (!leader || !leader->inuse || !leader->client || !ClientIsPlaying(leader->client))
++		return;
++
++	if (!ClientIsPlaying(ent->client) && ent->client->follow_target != leader) {
++		ent->client->follow_target = leader;
++		ent->client->follow_update = true;
++		UpdateChaseCam(ent);
++		MM_RefreshSkinOverridesForViewer(ent);
++	} else if (ent->client->eliminated && ent->client->follow_target != leader) {
++		ent->client->follow_queued_target = leader;
++		ent->client->follow_queued_time = level.time;
++	}
++}
++
++} // namespace
++
++client_config_t MM_DefaultClientConfig()
++{
++	client_config_t config{};
++	config.show_id = true;
++	config.show_timer = true;
++	config.show_fragmessages = true;
++	config.killbeep_num = 1;
++	config.follow_killer = false;
++	config.follow_leader = false;
++	config.follow_powerup = false;
++	config.use_expanded = false;
++	config.enemy_skin[0] = 0;
++	config.team_skin[0] = 0;
++	return config;
++}
++
+ /*
+ =============
+ MM_ClientInitPConfig
+ 
+-Load or create the player's configuration file on connect.
++Load or create the player's server-side configuration file on connect.
+ =============
+ */
+ void MM_ClientInitPConfig(gentity_t *ent)
+ {
+-	bool file_exists = false;
+-
+ 	if (!ent || !ent->client)
+ 		return;
+-	if (ent->svflags & SVF_BOT)
+-		return;
+ 
+-	// Validate and sanitize social_id for filesystem use
+-	// This prevents crashes from empty or malicious social_id values
+-	std::string safe_social_id = ent->client->pers.social_id[0]
+-		? muffmode::pconfig::SanitizeSocialId(ent->client->pers.social_id)
+-		: muffmode::pconfig::FallbackSocialId("unknown", ent);
++	ent->client->sess.pc = MM_DefaultClientConfig();
+ 
+-	if (safe_social_id.empty() || muffmode::pconfig::IsReservedWindowsDeviceName(safe_social_id.c_str()))
+-		safe_social_id = muffmode::pconfig::FallbackSocialId("invalid", ent);
++	if (ent->svflags & SVF_BOT)
++		return;
+ 
+-	const std::string path = fmt::format("baseq2/pcfg/{}.cfg", safe_social_id);
+-	const char *name = path.c_str();
++	const auto path = muffmode::pconfig::ConfigPathForClient(ent, true);
++	if (!path)
++		return;
+ 
+ 	if (!muffmode::pconfig::EnsureDirectory())
+ 		return;
+ 
+-	auto existing_file = muffmode::OpenFile(name, "rb");
++	const std::string name = path->string();
++	auto existing_file = muffmode::OpenFile(name.c_str(), "rb");
+ 	if (existing_file) {
+-		file_exists = true;
+-
+-		if (!muffmode::pconfig::ValidateReadableConfig(existing_file.get())) {
+-			gi.Com_PrintFmt("{}: Player config load error for \"{}\", discarding.\n", __FUNCTION__, name);
++		const auto config_text = muffmode::pconfig::ReadConfigText(existing_file.get());
++		if (!config_text) {
++			gi.Com_PrintFmt("{}: Player config load error for \"{}\"; using defaults.\n", __FUNCTION__, name);
+ 			return;
+ 		}
++
++		const auto stats = muffmode::pconfig::ApplyConfigText(ent->client->sess.pc, *config_text, name.c_str());
++		if (muffmode::pconfig::ShouldRewriteConfig(stats))
++			muffmode::pconfig::SavePConfig(ent, false);
++		muffmode::pconfig::ApplyLoadedConfigEffects(ent);
++		return;
+ 	}
+ 
+-	if (!file_exists) {
+-		auto new_file = muffmode::OpenFile(name, "wb");
+-		if (new_file) {
+-			const std::string header = fmt::format("// {}'s Player Config\n// Generated by Muff Mode\n",
+-				muffmode::pconfig::SanitizeConfigCommentText(ent->client->resp.netname));
++	muffmode::pconfig::SavePConfig(ent, true);
++	muffmode::pconfig::ApplyLoadedConfigEffects(ent);
++}
+ 
+-			if (std::fwrite(header.data(), 1, header.size(), new_file.get()) == header.size())
+-				gi.Com_PrintFmt("{}: Player config written to: \"{}\"\n", __FUNCTION__, name);
+-			else
+-				gi.Com_PrintFmt("{}: Player config write error: \"{}\"\n", __FUNCTION__, name);
+-		} else {
+-			gi.Com_PrintFmt("{}: Cannot save player config: {}\n", __FUNCTION__, name);
+-		}
+-	} else {
+-		//gi.Com_PrintFmt("{}: Player config not saved as file already exists: \"{}\"\n", __FUNCTION__, name);
+-	}
++bool MM_ClientSavePConfig(gentity_t *ent)
++{
++	return muffmode::pconfig::SavePConfig(ent, false) == muffmode::pconfig::save_result_t::saved;
++}
++
++void MM_ClientSavePConfigOrWarn(gentity_t *ent)
++{
++	muffmode::pconfig::WarnSaveResult(ent, muffmode::pconfig::SavePConfig(ent, false));
++}
++
++bool MM_PConfigGetBool(const gentity_t *ent, mm_pconfig_bool_setting_t setting)
++{
++	const bool *field = MM_PConfigBoolField(ent, setting);
++	return field ? *field : false;
++}
++
++bool MM_PConfigSetBool(gentity_t *ent, mm_pconfig_bool_setting_t setting, bool value)
++{
++	bool *field = MM_PConfigBoolField(ent, setting);
++	if (!field)
++		return false;
++
++	*field = value;
++	MM_ClientSavePConfigOrWarn(ent);
++	MM_PConfigApplyBoolEffects(ent, setting, value);
++	return true;
++}
++
++bool MM_PConfigToggleBool(gentity_t *ent, mm_pconfig_bool_setting_t setting)
++{
++	bool *field = MM_PConfigBoolField(ent, setting);
++	return field && MM_PConfigSetBool(ent, setting, !*field);
++}
++
++const char *MM_PConfigBoolText(bool value)
++{
++	return muffmode::pconfig::BoolText(value);
++}
++
++const char *MM_PConfigKillBeepName(int value)
++{
++	if (value < 0 || value >= static_cast<int>(muffmode::pconfig::k_kill_beep_names.size()))
++		return "unknown";
++
++	return muffmode::pconfig::k_kill_beep_names[value];
++}
++
++int MM_PConfigKillBeepCount()
++{
++	return static_cast<int>(muffmode::pconfig::k_kill_beep_names.size());
++}
++
++bool MM_PConfigSetKillBeep(gentity_t *ent, int value)
++{
++	if (!ent || !ent->client || value < 0 || value >= MM_PConfigKillBeepCount())
++		return false;
++
++	ent->client->sess.pc.killbeep_num = value;
++	MM_ClientSavePConfigOrWarn(ent);
++	return true;
++}
++
++bool MM_PConfigCycleKillBeep(gentity_t *ent)
++{
++	if (!ent || !ent->client)
++		return false;
++
++	return MM_PConfigSetKillBeep(ent, (ent->client->sess.pc.killbeep_num + 1) % MM_PConfigKillBeepCount());
+ }
+ 
+ /*
+@@ -238,11 +724,10 @@ MM_CmdCrosshairID
+ */
+ void MM_CmdCrosshairID(gentity_t *ent)
+ {
+-	if (!muffmode::pconfig::RequireNoCommandArgs(ent))
++	if (!ent || !ent->client)
+ 		return;
+ 
+-	ent->client->sess.pc.show_id ^= true;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Player identification display: {}\n", ent->client->sess.pc.show_id ? "ON" : "OFF");
++	muffmode::pconfig::SetBoolPreference(ent, mm_pconfig_bool_setting_t::show_id, "Player identification display");
+ }
+ 
+ /*
+@@ -252,11 +737,10 @@ MM_CmdTimer
+ */
+ void MM_CmdTimer(gentity_t *ent)
+ {
+-	if (!muffmode::pconfig::RequireNoCommandArgs(ent))
++	if (!ent || !ent->client)
+ 		return;
+ 
+-	ent->client->sess.pc.show_timer ^= true;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Match timer display: {}\n", ent->client->sess.pc.show_timer ? "ON" : "OFF");
++	muffmode::pconfig::SetBoolPreference(ent, mm_pconfig_bool_setting_t::show_timer, "Match timer display");
+ }
+ 
+ /*
+@@ -266,11 +750,10 @@ MM_CmdFragMessages
+ */
+ void MM_CmdFragMessages(gentity_t *ent)
+ {
+-	if (!muffmode::pconfig::RequireNoCommandArgs(ent))
++	if (!ent || !ent->client)
+ 		return;
+ 
+-	ent->client->sess.pc.show_fragmessages ^= true;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "{} frag messages.\n", ent->client->sess.pc.show_fragmessages ? "Activating" : "Disabling");
++	muffmode::pconfig::SetBoolPreference(ent, mm_pconfig_bool_setting_t::show_fragmessages, "Frag messages");
+ }
+ 
+ /*
+@@ -280,11 +763,10 @@ MM_CmdAnnouncer
+ */
+ void MM_CmdAnnouncer(gentity_t *ent)
+ {
+-	if (!muffmode::pconfig::RequireNoCommandArgs(ent))
++	if (!ent || !ent->client)
+ 		return;
+ 
+-	ent->client->sess.pc.use_expanded ^= true;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Match announcer: {}\n", ent->client->sess.pc.use_expanded ? "ON" : "OFF");
++	muffmode::pconfig::SetBoolPreference(ent, mm_pconfig_bool_setting_t::use_expanded, "Match announcer");
+ }
+ 
+ /*
+@@ -294,21 +776,85 @@ MM_CmdKillBeep
+ */
+ void MM_CmdKillBeep(gentity_t *ent)
+ {
+-	if (!muffmode::pconfig::RequireCommandArgc(ent, 1, 2, G_Fmt("{} [0-4]", gi.argv(0)).data()))
++	if (!ent || !ent->client)
++		return;
++
++	if (!muffmode::pconfig::RequireCommandArgc(ent, 1, 2, G_Fmt("{} [0-4|off|clang|beep-boop|insane|tang-tang]", gi.argv(0)).data()))
+ 		return;
+ 
+ 	int num = 0;
+ 	if (gi.argc() > 1) {
+-		const auto parsed = MM_ParseNonNegativeIntArg(gi.argv(1));
+-		if (!parsed || *parsed > 4) {
+-			gi.LocClient_Print(ent, PRINT_HIGH, "Invalid kill beep value. Use 0 through 4.\n");
++		const auto parsed = muffmode::pconfig::ParseKillBeepToken(gi.argv(1));
++		if (!parsed) {
++			gi.LocClient_Print(ent, PRINT_HIGH, "Invalid kill beep value. Use 0 through 4, off, clang, beep-boop, insane, or tang-tang.\n");
+ 			return;
+ 		}
+ 		num = *parsed;
+ 	} else {
+-		num = (ent->client->sess.pc.killbeep_num + 1) % 5;
++		num = (ent->client->sess.pc.killbeep_num + 1) % MM_PConfigKillBeepCount();
+ 	}
+-	constexpr std::array<const char *, 5> kill_beep_names = { "off", "clang", "beep-boop", "insane", "tang-tang" };
+-	ent->client->sess.pc.killbeep_num = num;
+-	gi.LocClient_Print(ent, PRINT_HIGH, "Kill beep changed to: {}\n", kill_beep_names[num]);
++
++	MM_PConfigSetKillBeep(ent, num);
++	gi.LocClient_Print(ent, PRINT_HIGH, "Kill beep changed to: {}\n", MM_PConfigKillBeepName(num));
++}
++
++/*
++=================
++MM_CmdFollowKiller
++=================
++*/
++void MM_CmdFollowKiller(gentity_t *ent)
++{
++	if (!ent || !ent->client)
++		return;
++
++	muffmode::pconfig::SetBoolPreference(ent, mm_pconfig_bool_setting_t::follow_killer, "Auto-follow killer");
++}
++
++/*
++=================
++MM_CmdFollowLeader
++=================
++*/
++void MM_CmdFollowLeader(gentity_t *ent)
++{
++	if (!ent || !ent->client)
++		return;
++
++	const auto value = muffmode::pconfig::ReadOptionalBoolCommandArg(ent, ent->client->sess.pc.follow_leader);
++	if (!value)
++		return;
++
++	gentity_t *leader = nullptr;
++	if (*value) {
++		leader = level.num_playing_clients > 0 ? muffmode::pconfig::ClientEntityForClientIndex(level.sorted_clients[0]) : nullptr;
++	}
++
++	MM_PConfigSetBool(ent, mm_pconfig_bool_setting_t::follow_leader, *value);
++
++	if (!*value) {
++		gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow leader: OFF\n");
++		return;
++	}
++
++	if (ent->client->sess.pc.follow_leader && (!leader || !leader->inuse || !leader->client || !ClientIsPlaying(leader->client))) {
++		gi.Client_Print(ent, PRINT_HIGH, "No leader available to follow yet.\n");
++		gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow leader: ON\n");
++		return;
++	}
++
++	gi.LocClient_Print(ent, PRINT_HIGH, "Auto-follow leader: ON\n");
++}
++
++/*
++=================
++MM_CmdFollowPowerup
++=================
++*/
++void MM_CmdFollowPowerup(gentity_t *ent)
++{
++	if (!ent || !ent->client)
++		return;
++
++	muffmode::pconfig::SetBoolPreference(ent, mm_pconfig_bool_setting_t::follow_powerup, "Auto-follow powerup pick-ups");
+ }
+diff --git a/src/sgame/muffmode/mm_pconfig.h b/src/sgame/muffmode/mm_pconfig.h
+index 224e4fd9..a4527891 100644
+--- a/src/sgame/muffmode/mm_pconfig.h
++++ b/src/sgame/muffmode/mm_pconfig.h
+@@ -4,11 +4,36 @@
+ #pragma once
+ 
+ struct gentity_t;
++struct client_config_t;
++
++enum class mm_pconfig_bool_setting_t {
++	show_id,
++	show_timer,
++	show_fragmessages,
++	use_expanded,
++	follow_killer,
++	follow_leader,
++	follow_powerup
++};
+ 
+ // [MuffMode] Per-player config persistence and preference commands.
++client_config_t MM_DefaultClientConfig();
+ void MM_ClientInitPConfig(gentity_t *ent);
++bool MM_ClientSavePConfig(gentity_t *ent);
++void MM_ClientSavePConfigOrWarn(gentity_t *ent);
++bool MM_PConfigGetBool(const gentity_t *ent, mm_pconfig_bool_setting_t setting);
++bool MM_PConfigSetBool(gentity_t *ent, mm_pconfig_bool_setting_t setting, bool value);
++bool MM_PConfigToggleBool(gentity_t *ent, mm_pconfig_bool_setting_t setting);
++const char *MM_PConfigBoolText(bool value);
++const char *MM_PConfigKillBeepName(int value);
++int MM_PConfigKillBeepCount();
++bool MM_PConfigSetKillBeep(gentity_t *ent, int value);
++bool MM_PConfigCycleKillBeep(gentity_t *ent);
+ void MM_CmdCrosshairID(gentity_t *ent);
+ void MM_CmdTimer(gentity_t *ent);
+ void MM_CmdFragMessages(gentity_t *ent);
+ void MM_CmdAnnouncer(gentity_t *ent);
+ void MM_CmdKillBeep(gentity_t *ent);
++void MM_CmdFollowKiller(gentity_t *ent);
++void MM_CmdFollowLeader(gentity_t *ent);
++void MM_CmdFollowPowerup(gentity_t *ent);
+diff --git a/src/sgame/muffmode/mm_pconfig_rules.h b/src/sgame/muffmode/mm_pconfig_rules.h
+new file mode 100644
+index 00000000..7d3402a5
+--- /dev/null
++++ b/src/sgame/muffmode/mm_pconfig_rules.h
+@@ -0,0 +1,186 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++#include <charconv>
++#include <optional>
++#include <string>
++#include <string_view>
++#include <system_error>
++
++namespace muffmode::pconfig {
++
++inline bool IsAsciiAlpha(char c) noexcept
++{
++	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
++}
++
++inline bool IsAsciiDigit(char c) noexcept
++{
++	return c >= '0' && c <= '9';
++}
++
++inline bool IsAsciiAlphaNumeric(char c) noexcept
++{
++	return IsAsciiAlpha(c) || IsAsciiDigit(c);
++}
++
++inline char ToAsciiLower(char c) noexcept
++{
++	return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + ('a' - 'A')) : c;
++}
++
++inline bool EqualsI(std::string_view lhs, std::string_view rhs) noexcept
++{
++	if (lhs.size() != rhs.size())
++		return false;
++
++	for (size_t i = 0; i < lhs.size(); i++) {
++		if (ToAsciiLower(lhs[i]) != ToAsciiLower(rhs[i]))
++			return false;
++	}
++
++	return true;
++}
++
++inline std::string SanitizeConfigCommentText(std::string_view text, size_t max_length)
++{
++	if (text.empty())
++		return "Player";
++
++	std::string out;
++	out.reserve(max_length);
++
++	for (const unsigned char ch : text) {
++		if (out.size() >= max_length)
++			break;
++		if (ch < ' ' || ch == 0x7F) {
++			if (!out.empty() && out.back() != ' ')
++				out += ' ';
++			continue;
++		}
++
++		out += static_cast<char>(ch);
++	}
++
++	while (!out.empty() && out.back() == ' ')
++		out.pop_back();
++
++	return out.empty() ? "Player" : out;
++}
++
++inline char HexDigit(unsigned int value) noexcept
++{
++	return static_cast<char>(value < 10 ? ('0' + value) : ('a' + (value - 10)));
++}
++
++inline std::optional<std::string> EncodeSocialIdConfigStem(std::string_view social_id, size_t max_social_id_length, size_t max_stem_length)
++{
++	constexpr std::string_view prefix = "sid-";
++	if (social_id.empty() || social_id.size() > max_social_id_length)
++		return std::nullopt;
++	if (prefix.size() + (social_id.size() * 2) > max_stem_length)
++		return std::nullopt;
++
++	std::string out;
++	out.reserve(prefix.size() + (social_id.size() * 2));
++	out.append(prefix);
++
++	for (const unsigned char ch : social_id) {
++		out += HexDigit(ch >> 4);
++		out += HexDigit(ch & 0x0F);
++	}
++
++	return out;
++}
++
++inline bool IsDisableToken(std::string_view value) noexcept
++{
++	return EqualsI(value, "off") ||
++		EqualsI(value, "clear") ||
++		EqualsI(value, "reset") ||
++		EqualsI(value, "default");
++}
++
++inline std::optional<bool> ParseBoolToken(std::string_view value) noexcept
++{
++	if (EqualsI(value, "1") || EqualsI(value, "on") || EqualsI(value, "true") ||
++		EqualsI(value, "yes") || EqualsI(value, "enable") || EqualsI(value, "enabled")) {
++		return true;
++	}
++
++	if (EqualsI(value, "0") || EqualsI(value, "off") || EqualsI(value, "false") ||
++		EqualsI(value, "no") || EqualsI(value, "disable") || EqualsI(value, "disabled")) {
++		return false;
++	}
++
++	return std::nullopt;
++}
++
++inline std::optional<int> ParseKillBeepToken(std::string_view value) noexcept
++{
++	if (EqualsI(value, "off"))
++		return 0;
++	if (EqualsI(value, "clang"))
++		return 1;
++	if (EqualsI(value, "beep-boop") || EqualsI(value, "beepboop"))
++		return 2;
++	if (EqualsI(value, "insane"))
++		return 3;
++	if (EqualsI(value, "tang-tang") || EqualsI(value, "tangtang"))
++		return 4;
++
++	int parsed = 0;
++	const char *begin = value.data();
++	const char *end = begin + value.size();
++	const auto [ptr, ec] = std::from_chars(begin, end, parsed);
++	if (ec != std::errc{} || ptr != end || parsed < 0 || parsed > 4)
++		return std::nullopt;
++
++	return parsed;
++}
++
++inline bool IsSafeSkinPath(std::string_view skin) noexcept
++{
++	if (skin.empty())
++		return false;
++
++	bool saw_slash = false;
++	char previous = 0;
++
++	for (size_t i = 0; i < skin.size(); i++) {
++		const char ch = skin[i];
++
++		if (IsAsciiAlphaNumeric(ch) || ch == '_' || ch == '-') {
++			previous = ch;
++			continue;
++		}
++
++		if (ch == '/') {
++			if (i == 0 || previous == '/' || i + 1 == skin.size())
++				return false;
++			saw_slash = true;
++			previous = ch;
++			continue;
++		}
++
++		return false;
++	}
++
++	return saw_slash && skin.find("..") == std::string_view::npos;
++}
++
++inline bool SkinFitsPlayerConfigString(std::string_view skin, size_t max_netname_length, size_t configstring_size) noexcept
++{
++	return (max_netname_length + 1 + skin.size() + 1 + std::string_view("default").size()) < configstring_size;
++}
++
++inline bool IsStorableSkinPath(std::string_view skin, size_t max_qpath, size_t max_netname_length, size_t configstring_size) noexcept
++{
++	return IsSafeSkinPath(skin) &&
++		skin.size() < max_qpath &&
++		SkinFitsPlayerConfigString(skin, max_netname_length, configstring_size);
++}
++
++} // namespace muffmode::pconfig
+diff --git a/src/sgame/muffmode/mm_ranks.cpp b/src/sgame/muffmode/mm_ranks.cpp
+new file mode 100644
+index 00000000..94a9e573
+--- /dev/null
++++ b/src/sgame/muffmode/mm_ranks.cpp
+@@ -0,0 +1,148 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#include "g_local.h"
++#include "muffmode/mm_ranks.h"
++#include "muffmode/mm_ranks_rules.h"
++
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <string>
++#include <vector>
++
++namespace {
++
++constexpr const char *k_rank_file = "baseq2/ranks.cfg";
++
++std::vector<muffmode::ranks::RankRecord> g_ranks;
++
++bool ReadFileText(const std::filesystem::path &path, std::string &out) {
++	std::error_code ec;
++	if (!std::filesystem::exists(path, ec))
++		return false;
++	std::ifstream in(path, std::ios::binary);
++	if (!in)
++		return false;
++	out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
++	return true;
++}
++
++bool WriteRankFile() {
++	const std::filesystem::path path(k_rank_file);
++	const std::filesystem::path tmp = std::filesystem::path(std::string(k_rank_file) + ".tmp");
++	std::error_code ec;
++	std::filesystem::create_directories(path.parent_path(), ec);
++	{
++		std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
++		if (!out)
++			return false;
++		const std::string text = muffmode::ranks::FormatRankFile(g_ranks);
++		out.write(text.data(), static_cast<std::streamsize>(text.size()));
++		if (!out.good())
++			return false;
++	}
++	std::filesystem::rename(tmp, path, ec);
++	if (ec) {
++		std::filesystem::remove(path, ec);
++		std::filesystem::rename(tmp, path, ec);
++	}
++	return !ec;
++}
++
++} // namespace
++
++void MM_Ranks_Load() {
++	g_ranks.clear();
++	std::string text;
++	if (ReadFileText(k_rank_file, text))
++		g_ranks = muffmode::ranks::ParseRankFile(text);
++	gi.Com_PrintFmt("MuffMode: loaded {} ranked player(s) from {}\n", g_ranks.size(), k_rank_file);
++}
++
++size_t MM_Ranks_Count() {
++	return g_ranks.size();
++}
++
++void MM_Ranks_RecordMatch() {
++	struct Live {
++		std::string sid, name;
++		int score = 0, kills = 0, deaths = 0, place = 1, elo = muffmode::ranks::k_elo_start;
++	};
++
++	std::vector<Live> live;
++	for (int i = 1; i <= static_cast<int>(game.maxclients); ++i) {
++		gentity_t *ec = &g_entities[i];
++		if (!ec->inuse || !ec->client)
++			continue;
++		if (ec->client->sess.is_a_bot)
++			continue; // bots never rank
++		if (!ClientIsPlaying(ec->client))
++			continue; // skip spectators
++		const char *sid = ec->client->pers.social_id;
++		if (sid == nullptr || sid[0] == '\0')
++			continue; // no stable identity -> skip
++
++		Live L;
++		L.sid = sid;
++		L.name = ec->client->resp.netname;
++		L.score = ec->client->resp.score;
++		L.kills = MS_Value(ec->client, MSTAT_KILLS_TOTAL);
++		L.deaths = MS_Value(ec->client, MSTAT_DEATHS_TOTAL);
++		const size_t idx = muffmode::ranks::FindRankIndex(g_ranks, L.sid);
++		L.elo = (idx == static_cast<size_t>(-1)) ? muffmode::ranks::k_elo_start : g_ranks[idx].elo;
++		live.push_back(std::move(L));
++	}
++
++	if (live.size() < 2)
++		return; // a ranked match needs >= 2 human players
++
++	// Placement by score; equal scores share a place.
++	for (Live &L : live) {
++		int better = 0;
++		for (const Live &O : live)
++			if (O.score > L.score)
++				++better;
++		L.place = better + 1;
++	}
++
++	std::vector<muffmode::ranks::MatchStanding> standings;
++	standings.reserve(live.size());
++	for (const Live &L : live)
++		standings.push_back({ L.elo, L.place });
++	const std::vector<int> deltas = muffmode::ranks::ComputeEloDeltas(standings);
++
++	for (size_t i = 0; i < live.size(); ++i) {
++		muffmode::ranks::RankRecord &r = muffmode::ranks::FindOrCreate(g_ranks, live[i].sid, live[i].name);
++		muffmode::ranks::MergeMatch(r, live[i].kills, live[i].deaths, live[i].place == 1);
++		r.elo += deltas[i];
++		if (r.elo < 100)
++			r.elo = 100;
++	}
++
++	WriteRankFile();
++	gi.Com_PrintFmt("MuffMode: recorded ranked match for {} player(s)\n", live.size());
++}
++
++void MM_Ranks_TopLines(int count, std::vector<std::string> &out) {
++	const std::vector<const muffmode::ranks::RankRecord *> lb = muffmode::ranks::Leaderboard(g_ranks);
++	int n = 0;
++	for (const muffmode::ranks::RankRecord *r : lb) {
++		if (n >= count)
++			break;
++		out.push_back(G_Fmt("{:2}. {:<12.12} {:>4}", n + 1, r->name, r->elo).data());
++		++n;
++	}
++}
++
++void MM_Ranks_ScoreLines(int count, std::vector<std::string> &out) {
++	const std::vector<const muffmode::ranks::RankRecord *> lb = muffmode::ranks::Leaderboard(g_ranks);
++	int n = 0;
++	for (const muffmode::ranks::RankRecord *r : lb) {
++		if (n >= count)
++			break;
++		const double kd = r->deaths > 0 ? static_cast<double>(r->kills) / r->deaths : static_cast<double>(r->kills);
++		out.push_back(G_Fmt("{:2}.{:<11.11}{:>4}{:>6.2f}", n + 1, r->name, r->elo, kd).data());
++		++n;
++	}
++}
+diff --git a/src/sgame/muffmode/mm_ranks.h b/src/sgame/muffmode/mm_ranks.h
+new file mode 100644
+index 00000000..bb08ade7
+--- /dev/null
++++ b/src/sgame/muffmode/mm_ranks.h
+@@ -0,0 +1,34 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// Cross-session player leaderboard. Persisted to baseq2/ranks.cfg, keyed by
++// social_id. Elo + lifetime totals update once per finished match from the
++// human roster (bots never rank). Pure math/record logic lives in
++// mm_ranks_rules.h; this is the live glue used by Match_End and the in-game
++// leaderboard menu.
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++struct gentity_t;
++
++// Load ranks from disk. Called once from InitGame().
++void MM_Ranks_Load();
++
++// Fold the just-finished match into the leaderboard and persist. Ranked only
++// when >= 2 human players took part; bots and spectators are ignored.
++void MM_Ranks_RecordMatch();
++
++// Number of ranked players on record.
++size_t MM_Ranks_Count();
++
++// Fill `out` with up to `count` formatted leaderboard rows (highest Elo first),
++// e.g. " 1. Xaero            1487  60W". Used by the `leaderboard` console command.
++void MM_Ranks_TopLines(int count, std::vector<std::string> &out);
++
++// Fill `out` with up to `count` all-time-scoreboard rows: rank, name, Elo, K/D.
++// Used by the in-game "All-Time Scoreboard" menu.
++void MM_Ranks_ScoreLines(int count, std::vector<std::string> &out);
+diff --git a/src/sgame/muffmode/mm_ranks_rules.h b/src/sgame/muffmode/mm_ranks_rules.h
+new file mode 100644
+index 00000000..372513cb
+--- /dev/null
++++ b/src/sgame/muffmode/mm_ranks_rules.h
+@@ -0,0 +1,208 @@
++// Copyright (c) ZeniMax Media Inc.
++// Licensed under the GNU General Public License 2.0.
++
++#pragma once
++
++// Pure, host-testable player-ranking rules for the cross-session leaderboard.
++//
++// One record per player, keyed by social_id, persisted one-per-line as:
++//     social_id|name|elo|matches|wins|kills|deaths
++// Elo starts at k_elo_start and updates per match via pairwise comparison of the
++// human players' placements (bots never rank -> never passed in). Engine-free:
++// mm_ranks.cpp supplies file I/O, the live match roster, and the menu.
++
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <string>
++#include <string_view>
++#include <vector>
++
++namespace muffmode::ranks {
++
++constexpr int k_elo_start = 1000;
++constexpr int k_elo_kfactor = 16;
++constexpr int k_elo_spread_cap = 200; // clamp rating diff before expectation
++
++struct RankRecord {
++	std::string social_id;
++	std::string name;
++	int elo = k_elo_start;
++	int matches = 0;
++	int wins = 0;
++	int kills = 0;
++	int deaths = 0;
++};
++
++// One player's line in a finished match: their rating going in and final place
++// (1 = winner). Ties share a place.
++struct MatchStanding {
++	int elo;
++	int place;
++};
++
++inline std::string SanitizeField(std::string_view in) {
++	std::string out;
++	out.reserve(in.size());
++	for (char c : in)
++		out.push_back((c == '|' || c == '\n' || c == '\r') ? ' ' : c);
++	return out;
++}
++
++inline std::string FormatRankLine(const RankRecord &r) {
++	return SanitizeField(r.social_id) + "|" + SanitizeField(r.name) + "|" +
++		std::to_string(r.elo) + "|" + std::to_string(r.matches) + "|" +
++		std::to_string(r.wins) + "|" + std::to_string(r.kills) + "|" + std::to_string(r.deaths);
++}
++
++// Parse "social_id|name|elo|matches|wins|kills|deaths". Missing trailing fields
++// default. Returns false for blank/comment lines or an empty social_id.
++inline bool ParseRankLine(std::string_view line, RankRecord &out) {
++	size_t start = 0;
++	while (start < line.size() && (line[start] == ' ' || line[start] == '\t'))
++		++start;
++	line.remove_prefix(start);
++	if (line.empty() || line[0] == '#')
++		return false;
++
++	std::vector<std::string_view> f;
++	size_t pos = 0;
++	while (true) {
++		size_t bar = line.find('|', pos);
++		f.push_back(line.substr(pos, bar == std::string_view::npos ? std::string_view::npos : bar - pos));
++		if (bar == std::string_view::npos)
++			break;
++		pos = bar + 1;
++	}
++	if (f.empty() || f[0].empty())
++		return false;
++
++	auto to_int = [](std::string_view s, int def) {
++		int v = 0;
++		bool neg = false, any = false;
++		size_t i = 0;
++		if (i < s.size() && (s[i] == '-' || s[i] == '+')) { neg = s[i] == '-'; ++i; }
++		for (; i < s.size(); ++i) {
++			if (s[i] < '0' || s[i] > '9') return def;
++			v = v * 10 + (s[i] - '0');
++			any = true;
++		}
++		return any ? (neg ? -v : v) : def;
++	};
++
++	out = RankRecord{};
++	out.social_id = std::string(f[0]);
++	if (f.size() > 1) out.name = std::string(f[1]);
++	if (f.size() > 2) out.elo = to_int(f[2], k_elo_start);
++	if (f.size() > 3) out.matches = to_int(f[3], 0);
++	if (f.size() > 4) out.wins = to_int(f[4], 0);
++	if (f.size() > 5) out.kills = to_int(f[5], 0);
++	if (f.size() > 6) out.deaths = to_int(f[6], 0);
++	return true;
++}
++
++inline size_t FindRankIndex(const std::vector<RankRecord> &list, std::string_view social_id) {
++	for (size_t i = 0; i < list.size(); ++i)
++		if (list[i].social_id == social_id)
++			return i;
++	return static_cast<size_t>(-1);
++}
++
++// Return the record for social_id, creating a fresh one (elo = start) if absent.
++inline RankRecord &FindOrCreate(std::vector<RankRecord> &list, std::string_view social_id, std::string_view name) {
++	size_t idx = FindRankIndex(list, social_id);
++	if (idx == static_cast<size_t>(-1)) {
++		RankRecord r;
++		r.social_id = std::string(social_id);
++		r.name = std::string(name);
++		list.push_back(r);
++		return list.back();
++	}
++	if (!name.empty())
++		list[idx].name = std::string(name); // keep last-seen name fresh
++	return list[idx];
++}
++
++// Fold one match result into a player's lifetime totals (Elo handled separately).
++inline void MergeMatch(RankRecord &r, int kills, int deaths, bool win) {
++	r.matches += 1;
++	r.wins += win ? 1 : 0;
++	r.kills += kills;
++	r.deaths += deaths;
++}
++
++// Expected score of A vs B (0..1). Rating diff is clamped to +/- spread cap so a
++// single lopsided matchup can't swing ratings wildly.
++inline double EloExpected(int elo_a, int elo_b) {
++	int diff = elo_b - elo_a;
++	if (diff > k_elo_spread_cap) diff = k_elo_spread_cap;
++	if (diff < -k_elo_spread_cap) diff = -k_elo_spread_cap;
++	return 1.0 / (1.0 + std::pow(10.0, diff / 400.0));
++}
++
++// Compute integer Elo deltas for a match. Each player is compared pairwise to
++// every other: actual = 1 if they placed better, 0.5 tie, 0 worse. Returns one
++// delta per standing (same order). Fewer than 2 players -> all zero.
++inline std::vector<int> ComputeEloDeltas(const std::vector<MatchStanding> &standings) {
++	std::vector<int> deltas(standings.size(), 0);
++	if (standings.size() < 2)
++		return deltas;
++	for (size_t i = 0; i < standings.size(); ++i) {
++		double sum = 0.0;
++		for (size_t j = 0; j < standings.size(); ++j) {
++			if (i == j)
++				continue;
++			double actual = standings[i].place < standings[j].place ? 1.0
++				: (standings[i].place == standings[j].place ? 0.5 : 0.0);
++			sum += actual - EloExpected(standings[i].elo, standings[j].elo);
++		}
++		deltas[i] = static_cast<int>(std::lround(k_elo_kfactor * sum));
++	}
++	return deltas;
++}
++
++// Leaderboard order: Elo desc, then wins desc, then name asc for stability.
++inline std::vector<const RankRecord *> Leaderboard(const std::vector<RankRecord> &list) {
++	std::vector<const RankRecord *> out;
++	out.reserve(list.size());
++	for (const RankRecord &r : list)
++		out.push_back(&r);
++	std::sort(out.begin(), out.end(), [](const RankRecord *a, const RankRecord *b) {
++		if (a->elo != b->elo) return a->elo > b->elo;
++		if (a->wins != b->wins) return a->wins > b->wins;
++		return a->name < b->name;
++	});
++	return out;
++}
++
++inline std::string FormatRankFile(const std::vector<RankRecord> &list) {
++	std::string out;
++	for (const RankRecord &r : list) {
++		out += FormatRankLine(r);
++		out.push_back('\n');
++	}
++	return out;
++}
++
++inline std::vector<RankRecord> ParseRankFile(std::string_view text) {
++	std::vector<RankRecord> list;
++	size_t pos = 0;
++	while (pos <= text.size()) {
++		size_t nl = text.find('\n', pos);
++		std::string_view line = text.substr(pos, nl == std::string_view::npos ? std::string_view::npos : nl - pos);
++		if (!line.empty() && line.back() == '\r')
++			line.remove_suffix(1);
++		RankRecord r;
++		if (ParseRankLine(line, r)) {
++			size_t idx = FindRankIndex(list, r.social_id);
++			if (idx == static_cast<size_t>(-1)) list.push_back(r);
++			else list[idx] = r; // last wins on dupe
++		}
++		if (nl == std::string_view::npos)
++			break;
++		pos = nl + 1;
++	}
++	return list;
++}
++
++} // namespace muffmode::ranks
+diff --git a/src/sgame/muffmode/mm_skin.cpp b/src/sgame/muffmode/mm_skin.cpp
+index 4fe697d5..b9113693 100644
+--- a/src/sgame/muffmode/mm_skin.cpp
++++ b/src/sgame/muffmode/mm_skin.cpp
+@@ -2,9 +2,10 @@
+ // Licensed under the GNU General Public License 2.0.
+ 
+ #include "g_local.h"
++#include "muffmode/mm_pconfig.h"
++#include "muffmode/mm_pconfig_rules.h"
+ #include "muffmode/mm_skin.h"
+ 
+-#include <cctype>
+ #include <cstring>
+ 
+ //=======================================================================
+@@ -24,42 +25,6 @@ bool MM_IsClientEntity(gentity_t *ent) {
+ 	return ent && ent->inuse && ent->client && ent->client->pers.connected;
+ }
+ 
+-bool MM_IsDisableToken(const char *value) {
+-	return !Q_strcasecmp(value, "off") ||
+-		!Q_strcasecmp(value, "clear") ||
+-		!Q_strcasecmp(value, "reset") ||
+-		!Q_strcasecmp(value, "default");
+-}
+-
+-bool MM_IsSafeSkinPath(const char *skin) {
+-	if (!skin || !*skin)
+-		return false;
+-
+-	bool saw_slash = false;
+-	char previous = 0;
+-
+-	for (const char *c = skin; *c; ++c) {
+-		const unsigned char ch = static_cast<unsigned char>(*c);
+-
+-		if (std::isalnum(ch) || ch == '_' || ch == '-') {
+-			previous = *c;
+-			continue;
+-		}
+-
+-		if (ch == '/') {
+-			if (c == skin || previous == '/' || c[1] == 0)
+-				return false;
+-			saw_slash = true;
+-			previous = *c;
+-			continue;
+-		}
+-
+-		return false;
+-	}
+-
+-	return saw_slash && !std::strstr(skin, "..");
+-}
+-
+ size_t MM_PlayerSkinConfigStringLength(const char *netname, const char *skin) {
+ 	return std::strlen(netname) + 1 + std::strlen(skin) + 1 + std::strlen("default");
+ }
+@@ -68,14 +33,14 @@ bool MM_PlayerSkinConfigStringFits(const char *netname, const char *skin, int32_
+ 	return MM_PlayerSkinConfigStringLength(netname, skin) < CS_SIZE(CS_PLAYERSKINS + playernum);
+ }
+ 
+-bool MM_PlayerSkinFitsAnyNetname(const char *skin) {
+-	return ((MAX_NETNAME - 1) + 1 + std::strlen(skin) + 1 + std::strlen("default")) < CS_SIZE(CS_PLAYERSKINS);
++bool MM_PlayerSkinCanBeStored(const char *skin) {
++	return skin && muffmode::pconfig::IsStorableSkinPath(skin, MAX_QPATH, MAX_NETNAME - 1, CS_SIZE(CS_PLAYERSKINS));
+ }
+ 
+ bool MM_BuildSkinOverrideConfigString(gentity_t *target, const char *skin, char (&buffer)[CS_MAX_STRING_LENGTH]) {
+ 	if (!MM_IsClientEntity(target) || !skin || !*skin)
+ 		return false;
+-	if (!MM_IsSafeSkinPath(skin) || !MM_PlayerSkinFitsAnyNetname(skin))
++	if (!MM_PlayerSkinCanBeStored(skin))
+ 		return false;
+ 
+ 	const int32_t playernum = target - g_entities - 1;
+@@ -231,14 +196,15 @@ void MM_CmdSkinOverride(gentity_t *ent, bool is_enemy, const char *label, const
+ 
+ 	const char *skin = gi.argv(1);
+ 
+-	if (MM_IsDisableToken(skin)) {
++	if (muffmode::pconfig::IsDisableToken(skin)) {
+ 		store[0] = 0;
++		MM_ClientSavePConfigOrWarn(ent);
+ 		MM_RefreshSkinOverridesForViewer(ent);
+ 		gi.LocClient_Print(ent, PRINT_HIGH, "{} skin override cleared. Only your view changes; {} now use their normal skins for you.\n", label, affected_players);
+ 		return;
+ 	}
+ 
+-	if (!MM_IsSafeSkinPath(skin)) {
++	if (!muffmode::pconfig::IsSafeSkinPath(skin)) {
+ 		gi.LocClient_Print(ent, PRINT_HIGH,
+ 			"Usage: {} <model/skin> (example: {} male/grunt) or {} off. Only your view changes; {} are affected.\n"
+ 			"Skin paths may use letters, numbers, '_', '-', and '/'.\n",
+@@ -246,12 +212,13 @@ void MM_CmdSkinOverride(gentity_t *ent, bool is_enemy, const char *label, const
+ 		return;
+ 	}
+ 
+-	if (!MM_PlayerSkinFitsAnyNetname(skin)) {
++	if (!MM_PlayerSkinCanBeStored(skin)) {
+ 		gi.LocClient_Print(ent, PRINT_HIGH, "{} is too long for player skin configstrings.\n", skin);
+ 		return;
+ 	}
+ 
+ 	Q_strlcpy(store, skin, MAX_QPATH);
++	MM_ClientSavePConfigOrWarn(ent);
+ 	MM_RefreshSkinOverridesForViewer(ent);
+ 	gi.LocClient_Print(ent, PRINT_HIGH, "{} skin override set to '{}'. Only your view changes; {} will use that skin for you.\n", label, skin, affected_players);
+ }
+diff --git a/src/sgame/muffmode/mm_vote_menu.cpp b/src/sgame/muffmode/mm_vote_menu.cpp
+index f894f360..9741f243 100644
+--- a/src/sgame/muffmode/mm_vote_menu.cpp
++++ b/src/sgame/muffmode/mm_vote_menu.cpp
+@@ -825,6 +825,19 @@ void OpenCallVoteMenu(gentity_t *ent)
+ 	MenuVote_OpenMenu(ent, kCallVoteMenuTemplate, muffmode::CountAsInt(kCallVoteMenuTemplate), nullptr, UpdateCallVote);
+ }
+ 
++// [MuffMode] Hide call-vote categories that are disabled via g_vote_flags.
++static bool VoteTypeHidden(const char *cmd_name)
++{
++	vcmds_t *cc = FindVoteCmdByName(cmd_name);
++	return cc && (g_vote_flags->integer & cc->flag);
++}
++
++static void HideVoteEntry(menu_t &entry)
++{
++	entry.SelectFunc = nullptr;
++	MenuVote_SetText(entry, "");
++}
++
+ void UpdateCallVote(gentity_t *ent)
+ {
+ 	MenuVoteView view;
+@@ -931,6 +944,19 @@ void UpdateCallVote(gentity_t *ent)
+ 		MenuVote_SetText(entries[readyall_index], "Ready All: N/A");
+ 	}
+ 
++	// [MuffMode] Blank out any vote category disabled by g_vote_flags so only
++	// permitted vote types (e.g. map-only) appear in the call-vote menu.
++	const struct { int index; const char *cmd; } gated_entries[] = {
++		{ gametype_index, "gametype" }, { ruleset_index, "ruleset" }, { map_index, "map" },
++		{ scorelimit_index, "scorelimit" }, { timelimit_index, "timelimit" },
++		{ powerups_index, "powerups" }, { techs_index, "techs" },
++		{ friendlyfire_index, "friendlyfire" }, { shuffle_index, "shuffle" },
++		{ readyall_index, "readyall" },
++	};
++	for (const auto &g : gated_entries)
++		if (VoteTypeHidden(g.cmd))
++			HideVoteEntry(entries[g.index]);
++
+ 	MenuVote_ClearRange(view, readyall_index + 1, content_limit);
+ }
+ 
+diff --git a/tests/host/test_main.cpp b/tests/host/test_main.cpp
+index 6c7a0cef..b8aba2d3 100644
+--- a/tests/host/test_main.cpp
++++ b/tests/host/test_main.cpp
+@@ -2,14 +2,21 @@
+ // Licensed under the GNU General Public License 2.0.
+ 
+ #include "fake_game_import.h"
++#include "muffmode/mm_bans_rules.h"
++#include "muffmode/mm_bots_rules.h"
+ #include "muffmode/mm_command_contracts.h"
++#include "muffmode/mm_default_map_rules.h"
+ #include "muffmode/mm_hud_stat_contracts.h"
+ #include "muffmode/mm_horde_ai_rules.h"
+ #include "muffmode/mm_lms_rules.h"
+ #include "muffmode/mm_loc_parse.h"
++#include "muffmode/mm_map_size_rules.h"
+ #include "muffmode/mm_parse.h"
++#include "muffmode/mm_pconfig_rules.h"
++#include "muffmode/mm_ranks_rules.h"
+ #include "muffmode/mm_red_rover_rules.h"
+ 
++#include <algorithm>
+ #include <cstdio>
+ #include <exception>
+ #include <functional>
+@@ -64,6 +71,151 @@ void check(bool condition, const char *expression, const char *file, int line) {
+ #define MM_CHECK_FALSE(expr) check(!(expr), "!(" #expr ")", __FILE__, __LINE__)
+ #define MM_CHECK_EQ(lhs, rhs) check(((lhs) == (rhs)), #lhs " == " #rhs, __FILE__, __LINE__)
+ 
++MM_TEST(bans_parse_and_format_roundtrip) {
++	muffmode::bans::BanRecord rec;
++	MM_CHECK(muffmode::bans::ParseBanLine("STEAM_123|Grunt|spawn camping", rec));
++	MM_CHECK_EQ(rec.social_id, std::string("STEAM_123"));
++	MM_CHECK_EQ(rec.name, std::string("Grunt"));
++	MM_CHECK_EQ(rec.reason, std::string("spawn camping"));
++	MM_CHECK_EQ(muffmode::bans::FormatBanLine(rec), std::string("STEAM_123|Grunt|spawn camping"));
++}
++
++MM_TEST(bans_parse_rejects_blank_comment_and_empty_id) {
++	muffmode::bans::BanRecord rec;
++	MM_CHECK_FALSE(muffmode::bans::ParseBanLine("", rec));
++	MM_CHECK_FALSE(muffmode::bans::ParseBanLine("   ", rec));
++	MM_CHECK_FALSE(muffmode::bans::ParseBanLine("# a comment", rec));
++	MM_CHECK_FALSE(muffmode::bans::ParseBanLine("|noid|x", rec));
++}
++
++MM_TEST(bans_parse_id_only_and_extra_pipes_fold_into_reason) {
++	muffmode::bans::BanRecord rec;
++	MM_CHECK(muffmode::bans::ParseBanLine("ONLYID", rec));
++	MM_CHECK_EQ(rec.social_id, std::string("ONLYID"));
++	MM_CHECK(rec.name.empty());
++	MM_CHECK(rec.reason.empty());
++	MM_CHECK(muffmode::bans::ParseBanLine("ID|Bob|a|b|c", rec));
++	MM_CHECK_EQ(rec.reason, std::string("a|b|c"));
++}
++
++MM_TEST(bans_sanitize_strips_separators_and_newlines) {
++	muffmode::bans::BanRecord rec{ "ID", "Bad|Name", "line1\nline2\r" };
++	MM_CHECK_EQ(muffmode::bans::FormatBanLine(rec), std::string("ID|Bad Name|line1 line2 "));
++}
++
++MM_TEST(bans_add_dedupes_and_updates_by_social_id) {
++	std::vector<muffmode::bans::BanRecord> list;
++	MM_CHECK(muffmode::bans::AddOrUpdateBan(list, { "A", "Al", "r1" }));
++	MM_CHECK(muffmode::bans::AddOrUpdateBan(list, { "B", "Bo", "r2" }));
++	MM_CHECK_EQ(list.size(), size_t(2));
++	MM_CHECK_FALSE(muffmode::bans::AddOrUpdateBan(list, { "A", "Al2", "r3" })); // update, not add
++	MM_CHECK_EQ(list.size(), size_t(2));
++	MM_CHECK_EQ(list[0].name, std::string("Al2"));
++	MM_CHECK_EQ(list[0].reason, std::string("r3"));
++	MM_CHECK_FALSE(muffmode::bans::AddOrUpdateBan(list, { "", "x", "y" })); // empty id rejected
++	MM_CHECK_EQ(list.size(), size_t(2));
++}
++
++MM_TEST(bans_is_banned_and_remove) {
++	std::vector<muffmode::bans::BanRecord> list;
++	muffmode::bans::AddOrUpdateBan(list, { "A", "Al", "" });
++	MM_CHECK(muffmode::bans::IsBanned(list, "A"));
++	MM_CHECK_FALSE(muffmode::bans::IsBanned(list, "B"));
++	MM_CHECK_FALSE(muffmode::bans::IsBanned(list, "")); // empty never banned
++	MM_CHECK(muffmode::bans::RemoveBan(list, "A"));
++	MM_CHECK_FALSE(muffmode::bans::IsBanned(list, "A"));
++	MM_CHECK_FALSE(muffmode::bans::RemoveBan(list, "A")); // already gone
++}
++
++MM_TEST(bans_file_roundtrip_and_dedupe_on_load) {
++	std::vector<muffmode::bans::BanRecord> list;
++	muffmode::bans::AddOrUpdateBan(list, { "A", "Al", "r1" });
++	muffmode::bans::AddOrUpdateBan(list, { "B", "Bo", "" });
++	std::vector<muffmode::bans::BanRecord> loaded = muffmode::bans::ParseBanFile(muffmode::bans::FormatBanFile(list));
++	MM_CHECK_EQ(loaded.size(), size_t(2));
++	MM_CHECK(muffmode::bans::IsBanned(loaded, "A"));
++	MM_CHECK(muffmode::bans::IsBanned(loaded, "B"));
++	std::vector<muffmode::bans::BanRecord> dd = muffmode::bans::ParseBanFile("A|x|y\n# c\n\nA|z|w\nB|b|\n");
++	MM_CHECK_EQ(dd.size(), size_t(2)); // duplicate + comment + blank collapse
++}
++
++MM_TEST(ranks_parse_format_roundtrip_and_defaults) {
++	muffmode::ranks::RankRecord r;
++	MM_CHECK(muffmode::ranks::ParseRankLine("ID|Xaero|1487|214|60|5211|3980", r));
++	MM_CHECK_EQ(r.social_id, std::string("ID"));
++	MM_CHECK_EQ(r.name, std::string("Xaero"));
++	MM_CHECK_EQ(r.elo, 1487);
++	MM_CHECK_EQ(r.matches, 214);
++	MM_CHECK_EQ(r.wins, 60);
++	MM_CHECK_EQ(r.kills, 5211);
++	MM_CHECK_EQ(r.deaths, 3980);
++	MM_CHECK_EQ(muffmode::ranks::FormatRankLine(r), std::string("ID|Xaero|1487|214|60|5211|3980"));
++	muffmode::ranks::RankRecord r2;
++	MM_CHECK(muffmode::ranks::ParseRankLine("ID2|Bob", r2));
++	MM_CHECK_EQ(r2.elo, muffmode::ranks::k_elo_start);
++	MM_CHECK_EQ(r2.matches, 0);
++	MM_CHECK_FALSE(muffmode::ranks::ParseRankLine("", r));
++	MM_CHECK_FALSE(muffmode::ranks::ParseRankLine("# c", r));
++	MM_CHECK_FALSE(muffmode::ranks::ParseRankLine("|noid", r));
++}
++
++MM_TEST(ranks_find_or_create_defaults_and_merge_accumulates) {
++	std::vector<muffmode::ranks::RankRecord> list;
++	MM_CHECK_EQ(muffmode::ranks::FindOrCreate(list, "A", "Al").elo, muffmode::ranks::k_elo_start);
++	MM_CHECK_EQ(list.size(), size_t(1));
++	muffmode::ranks::MergeMatch(list[0], 20, 10, true);
++	muffmode::ranks::MergeMatch(list[0], 15, 12, false);
++	MM_CHECK_EQ(list[0].matches, 2);
++	MM_CHECK_EQ(list[0].wins, 1);
++	MM_CHECK_EQ(list[0].kills, 35);
++	MM_CHECK_EQ(list[0].deaths, 22);
++	MM_CHECK_EQ(muffmode::ranks::FindOrCreate(list, "A", "Al2").name, std::string("Al2")); // name refreshed
++	MM_CHECK_EQ(list.size(), size_t(1));
++}
++
++MM_TEST(ranks_elo_expected_symmetric_and_capped) {
++	MM_CHECK_EQ((int)std::lround(muffmode::ranks::EloExpected(1500, 1500) * 1000), 500);
++	MM_CHECK_EQ((int)std::lround(muffmode::ranks::EloExpected(1000, 2000) * 1000),
++	            (int)std::lround(muffmode::ranks::EloExpected(1000, 1200) * 1000)); // spread cap
++}
++
++MM_TEST(ranks_elo_deltas_symmetric_ties_and_underdog) {
++	auto d = muffmode::ranks::ComputeEloDeltas({ { 1000, 1 }, { 1000, 2 } });
++	MM_CHECK_EQ(d.size(), size_t(2));
++	MM_CHECK_EQ(d[0], 8);
++	MM_CHECK_EQ(d[1], -8);
++	auto t = muffmode::ranks::ComputeEloDeltas({ { 1000, 1 }, { 1000, 1 } });
++	MM_CHECK_EQ(t[0], 0);
++	MM_CHECK_EQ(t[1], 0);
++	auto s = muffmode::ranks::ComputeEloDeltas({ { 1000, 1 } });
++	MM_CHECK_EQ(s[0], 0);
++	auto fav = muffmode::ranks::ComputeEloDeltas({ { 1400, 1 }, { 1000, 2 } });
++	auto dog = muffmode::ranks::ComputeEloDeltas({ { 1000, 1 }, { 1400, 2 } });
++	MM_CHECK(dog[0] > fav[0]); // underdog winner gains more than a favourite
++}
++
++MM_TEST(ranks_leaderboard_orders_by_elo_then_wins) {
++	std::vector<muffmode::ranks::RankRecord> list;
++	muffmode::ranks::FindOrCreate(list, "A", "Al").elo = 1200;
++	muffmode::ranks::FindOrCreate(list, "B", "Bo").elo = 1500;
++	muffmode::ranks::FindOrCreate(list, "C", "Cy").elo = 1500;
++	list[2].wins = 10;
++	auto lb = muffmode::ranks::Leaderboard(list);
++	MM_CHECK_EQ(lb[0]->social_id, std::string("C"));
++	MM_CHECK_EQ(lb[1]->social_id, std::string("B"));
++	MM_CHECK_EQ(lb[2]->social_id, std::string("A"));
++}
++
++MM_TEST(ranks_file_roundtrip) {
++	std::vector<muffmode::ranks::RankRecord> list;
++	muffmode::ranks::FindOrCreate(list, "A", "Al").elo = 1100;
++	muffmode::ranks::FindOrCreate(list, "B", "Bo").elo = 1300;
++	auto loaded = muffmode::ranks::ParseRankFile(muffmode::ranks::FormatRankFile(list));
++	MM_CHECK_EQ(loaded.size(), size_t(2));
++	MM_CHECK_EQ(loaded[0].elo, 1100);
++	MM_CHECK_EQ(loaded[1].elo, 1300);
++}
++
+ MM_TEST(parse_helpers_trim_ascii_whitespace_without_touching_inner_text) {
+ 	MM_CHECK_EQ(std::string(MM_TrimAsciiWhitespace(std::string_view(" \tARENA\r\n"))), std::string("ARENA"));
+ 	MM_CHECK_EQ(std::string(MM_TrimAsciiWhitespace(std::string_view("A B"))), std::string("A B"));
+@@ -112,6 +264,66 @@ MM_TEST(parse_cfg_int_accepts_quoted_or_plain_values) {
+ 	MM_CHECK_FALSE(MM_ParseCfgIntArg("\"4\" extra"));
+ }
+ 
++MM_TEST(player_config_social_ids_encode_to_safe_unique_path_stems) {
++	using namespace muffmode::pconfig;
++
++	const auto plain = EncodeSocialIdConfigStem("a.b-c_123", 63, 251);
++	const auto path_like = EncodeSocialIdConfigStem("..abc/def\\ghi.", 63, 251);
++	const auto reserved = EncodeSocialIdConfigStem("con", 63, 251);
++	const auto max_fit = EncodeSocialIdConfigStem(std::string(123, 'a'), 123, 251);
++
++	MM_CHECK(plain);
++	MM_CHECK(path_like);
++	MM_CHECK(reserved);
++	MM_CHECK(max_fit);
++	MM_CHECK_EQ(*plain, std::string("sid-612e622d635f313233"));
++	MM_CHECK_EQ(*path_like, std::string("sid-2e2e6162632f6465665c6768692e"));
++	MM_CHECK_EQ(*reserved, std::string("sid-636f6e"));
++	MM_CHECK_FALSE(EncodeSocialIdConfigStem("", 63, 251));
++	MM_CHECK_FALSE(EncodeSocialIdConfigStem(std::string(64, 'a'), 63, 251));
++	MM_CHECK_FALSE(EncodeSocialIdConfigStem(std::string(124, 'a'), 124, 251));
++	MM_CHECK_FALSE(EncodeSocialIdConfigStem("ab", 63, 7));
++	MM_CHECK(*EncodeSocialIdConfigStem("ab", 63, 251) != *EncodeSocialIdConfigStem("a/b", 63, 251));
++}
++
++MM_TEST(player_config_tokens_parse_deterministically) {
++	using namespace muffmode::pconfig;
++
++	MM_CHECK_EQ(*ParseBoolToken("on"), true);
++	MM_CHECK_EQ(*ParseBoolToken("DISABLED"), false);
++	MM_CHECK_FALSE(ParseBoolToken("toggle"));
++
++	MM_CHECK_EQ(*ParseKillBeepToken("off"), 0);
++	MM_CHECK_EQ(*ParseKillBeepToken("beep-boop"), 2);
++	MM_CHECK_EQ(*ParseKillBeepToken("tangtang"), 4);
++	MM_CHECK_FALSE(ParseKillBeepToken("5"));
++}
++
++MM_TEST(player_config_skin_paths_match_command_safety_rules) {
++	using namespace muffmode::pconfig;
++
++	constexpr size_t max_qpath = 64;
++	constexpr size_t max_netname_length = 31;
++	constexpr size_t player_skin_configstring_size = 96;
++	const std::string longest_fit = std::string("model/") + std::string(49, 'a');
++	const std::string too_long = std::string("model/") + std::string(50, 'a');
++
++	MM_CHECK(IsSafeSkinPath("male/grunt"));
++	MM_CHECK(IsSafeSkinPath("players/male/grunt"));
++	MM_CHECK(IsDisableToken("default"));
++	MM_CHECK_FALSE(IsSafeSkinPath("male"));
++	MM_CHECK_FALSE(IsSafeSkinPath("/male/grunt"));
++	MM_CHECK_FALSE(IsSafeSkinPath("male/"));
++	MM_CHECK_FALSE(IsSafeSkinPath("male//grunt"));
++	MM_CHECK_FALSE(IsSafeSkinPath("male/gr.unt"));
++	MM_CHECK(SkinFitsPlayerConfigString(longest_fit, max_netname_length, player_skin_configstring_size));
++	MM_CHECK_FALSE(SkinFitsPlayerConfigString(too_long, max_netname_length, player_skin_configstring_size));
++	MM_CHECK(IsStorableSkinPath(longest_fit, max_qpath, max_netname_length, player_skin_configstring_size));
++	MM_CHECK_FALSE(IsStorableSkinPath(too_long, max_qpath, max_netname_length, player_skin_configstring_size));
++	MM_CHECK_FALSE(IsStorableSkinPath("male/gr.unt", max_qpath, max_netname_length, player_skin_configstring_size));
++	MM_CHECK_FALSE(IsStorableSkinPath(longest_fit, longest_fit.size(), max_netname_length, player_skin_configstring_size));
++}
++
+ MM_TEST(command_argument_contracts_match_phase_one_fixes) {
+ 	MM_CHECK(MM_IsTeleportArgcValid(4));
+ 	MM_CHECK(MM_IsTeleportArgcValid(7));
+@@ -342,6 +554,156 @@ MM_TEST(hud_stat_contract_miniscore_val_visibility) {
+ 	MM_CHECK_FALSE(MM_StatusbarLayoutLengthWithinBudget(MM_STATUSBAR_LAYOUT_MAX_CHARS + 1));
+ }
+ 
++MM_TEST(map_size_low_pop_yields_only_small) {
++	std::vector<std::string> small{ "s1", "s2" }, medium{ "m1" }, large{ "l1" };
++	auto e = MM_BuildEligibleSizedMaps(1, 3, 5, small, medium, large, "");
++	MM_CHECK_EQ(e.size(), 2u);
++	MM_CHECK(std::find(e.begin(), e.end(), std::string("m1")) == e.end());
++	MM_CHECK(std::find(e.begin(), e.end(), std::string("l1")) == e.end());
++}
++
++MM_TEST(map_size_medium_unlocks_exactly_at_threshold) {
++	std::vector<std::string> small{ "s1" }, medium{ "m1" }, large{ "l1" };
++	auto below = MM_BuildEligibleSizedMaps(2, 3, 5, small, medium, large, "");
++	MM_CHECK(std::find(below.begin(), below.end(), std::string("m1")) == below.end());
++	auto at = MM_BuildEligibleSizedMaps(3, 3, 5, small, medium, large, "");
++	MM_CHECK(std::find(at.begin(), at.end(), std::string("m1")) != at.end());
++	MM_CHECK(std::find(at.begin(), at.end(), std::string("l1")) == at.end());
++}
++
++MM_TEST(map_size_large_unlocks_exactly_at_threshold) {
++	std::vector<std::string> small{ "s1" }, medium{ "m1" }, large{ "l1" };
++	auto below = MM_BuildEligibleSizedMaps(4, 3, 5, small, medium, large, "");
++	MM_CHECK(std::find(below.begin(), below.end(), std::string("l1")) == below.end());
++	auto at = MM_BuildEligibleSizedMaps(5, 3, 5, small, medium, large, "");
++	MM_CHECK(std::find(at.begin(), at.end(), std::string("l1")) != at.end());
++	MM_CHECK(std::find(at.begin(), at.end(), std::string("m1")) != at.end());
++	MM_CHECK(std::find(at.begin(), at.end(), std::string("s1")) != at.end());
++}
++
++MM_TEST(map_size_dedupes_tokens_shared_across_buckets) {
++	std::vector<std::string> small{ "dup", "s1" }, medium{ "dup" }, large{};
++	auto e = MM_BuildEligibleSizedMaps(3, 3, 5, small, medium, large, "");
++	int dupcount = 0;
++	for (const auto &m : e) if (m == "dup") dupcount++;
++	MM_CHECK_EQ(dupcount, 1);
++}
++
++MM_TEST(map_size_avoids_immediate_repeat_when_alternative_exists) {
++	std::vector<std::string> small{ "s1", "s2" }, medium{}, large{};
++	auto e = MM_BuildEligibleSizedMaps(1, 3, 5, small, medium, large, "s1");
++	MM_CHECK_EQ(e.size(), 1u);
++	MM_CHECK_EQ(e[0], std::string("s2"));
++}
++
++MM_TEST(map_size_keeps_sole_map_even_if_current) {
++	std::vector<std::string> small{ "s1" }, medium{}, large{};
++	auto e = MM_BuildEligibleSizedMaps(1, 3, 5, small, medium, large, "s1");
++	MM_CHECK_EQ(e.size(), 1u);
++	MM_CHECK_EQ(e[0], std::string("s1"));
++}
++
++MM_TEST(bot_fill_disabled_cutoff_is_noop) {
++	auto d = MM_DecideBotFill(/*humans*/ 5, /*cutoff*/ 0, /*current_fill*/ 4, /*cached*/ 0);
++	MM_CHECK_FALSE(d.update_fill);
++	MM_CHECK_FALSE(d.kick_bots);
++}
++
++MM_TEST(bot_fill_at_cutoff_zeroes_and_kicks) {
++	auto d = MM_DecideBotFill(2, 2, 4, 0);
++	MM_CHECK(d.update_fill);
++	MM_CHECK_EQ(d.fill_value, 0);
++	MM_CHECK(d.kick_bots);
++	MM_CHECK_EQ(d.cached_fill, 4); // remembered before zeroing
++}
++
++MM_TEST(bot_fill_below_cutoff_allows_bots) {
++	auto d = MM_DecideBotFill(1, 2, 4, 0);
++	MM_CHECK_FALSE(d.update_fill); // already filling, nothing to change
++	MM_CHECK_FALSE(d.kick_bots);
++}
++
++MM_TEST(bot_fill_already_suppressed_stays_suppressed_and_keeps_cache) {
++	// Second tick while still at/above cutoff: fill already 0, don't re-force it,
++	// but keep kicking and preserve the cached fill.
++	auto d = MM_DecideBotFill(3, 2, 0, 4);
++	MM_CHECK_FALSE(d.update_fill);
++	MM_CHECK(d.kick_bots);
++	MM_CHECK_EQ(d.cached_fill, 4);
++}
++
++MM_TEST(bot_fill_restores_cached_when_humans_drop) {
++	// Humans left; fill was zeroed. Restore the cached value so bots return.
++	auto d = MM_DecideBotFill(1, 2, 0, 4);
++	MM_CHECK(d.update_fill);
++	MM_CHECK_EQ(d.fill_value, 4);
++	MM_CHECK_FALSE(d.kick_bots);
++}
++
++MM_TEST(bot_fill_off_restores_previously_zeroed_fill) {
++	// Feature toggled off after it had suppressed bots: bring the fill back.
++	auto d = MM_DecideBotFill(9, 0, 0, 4);
++	MM_CHECK(d.update_fill);
++	MM_CHECK_EQ(d.fill_value, 4);
++	MM_CHECK_FALSE(d.kick_bots);
++}
++
++MM_TEST(bot_fill_no_cache_yet_at_cutoff_only_kicks) {
++	// Server booted with bots off (fill 0, no cache). At cutoff we still kick any
++	// stray bot but have nothing to force and nothing to cache.
++	auto d = MM_DecideBotFill(2, 2, 0, 0);
++	MM_CHECK_FALSE(d.update_fill);
++	MM_CHECK(d.kick_bots);
++	MM_CHECK_EQ(d.cached_fill, 0);
++}
++
++MM_TEST(map_size_current_match_is_case_insensitive) {
++	std::vector<std::string> small{ "Q2DM2", "q64/dm1" }, medium{}, large{};
++	auto e = MM_BuildEligibleSizedMaps(1, 3, 5, small, medium, large, "q2dm2");
++	MM_CHECK(std::find(e.begin(), e.end(), std::string("Q2DM2")) == e.end());
++	MM_CHECK_EQ(e.size(), 1u);
++}
++
++MM_TEST(map_size_empty_buckets_yield_no_selection) {
++	std::vector<std::string> empty{};
++	auto e = MM_BuildEligibleSizedMaps(1, 3, 5, empty, empty, empty, "");
++	MM_CHECK(e.empty());
++	MM_CHECK(MM_PickEligibleIndex(e.size(), 12345u) == SIZE_MAX);
++}
++
++MM_TEST(map_size_pick_index_is_deterministic_modulo) {
++	MM_CHECK(MM_PickEligibleIndex(3, 0u) == 0u);
++	MM_CHECK(MM_PickEligibleIndex(3, 1u) == 1u);
++	MM_CHECK(MM_PickEligibleIndex(3, 7u) == 1u); // 7 % 3
++	MM_CHECK(MM_PickEligibleIndex(0, 7u) == SIZE_MAX);
++}
++
++MM_TEST(default_map_resolve_trims_and_detects_empty) {
++	MM_CHECK_EQ(MM_ResolveDefaultMap(""), std::string(""));
++	MM_CHECK_EQ(MM_ResolveDefaultMap("   "), std::string(""));
++	MM_CHECK_EQ(MM_ResolveDefaultMap("\t \t"), std::string(""));
++	MM_CHECK_EQ(MM_ResolveDefaultMap("q2dm8"), std::string("q2dm8"));
++	MM_CHECK_EQ(MM_ResolveDefaultMap("  q64/dm2  "), std::string("q64/dm2"));
++	MM_CHECK_EQ(MM_ResolveDefaultMap("q2dm1\t"), std::string("q2dm1"));
++}
++
++MM_TEST(default_map_config_parse_extracts_quoted_token) {
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("set g_default_map \"q64/dm1\"\n"), std::string("q64/dm1"));
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("set g_default_map \"  q2dm8  \"\n"), std::string("q2dm8"));
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("set g_default_map \"\"\n"), std::string(""));
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig(""), std::string(""));
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("garbage without quotes"), std::string(""));
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("set g_default_map \"q2dm1"), std::string("")); // unterminated
++}
++
++MM_TEST(default_map_config_parse_ignores_boot_map_line) {
++	// MM_DefaultMap_Save also appends a `map "<token>"` boot line for the
++	// net.cfg `exec defaultmap.cfg` hook; the parser must keep reading the
++	// token from the first (set) line only.
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("set g_default_map \"q64/dm3\"\nmap \"q64/dm3\"\n"), std::string("q64/dm3"));
++	MM_CHECK_EQ(MM_ParseDefaultMapConfig("set g_default_map \"q2dm2\"\nmap \"IGNORED/other\"\n"), std::string("q2dm2"));
++}
++
+ } // namespace
+ 
+ int main() {
